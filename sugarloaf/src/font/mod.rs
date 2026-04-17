@@ -466,6 +466,7 @@ impl FontLibraryData {
             }
         }
 
+        self.insert(FontData::from_slice(FONT_TWEMOJI_EMOJI).unwrap());
         self.insert(FontData::from_slice(FONT_SYMBOLS_NERD_FONT_MONO).unwrap());
 
         // TODO: Currently, it will naively just extend fonts from symbol_map
