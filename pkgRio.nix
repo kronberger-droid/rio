@@ -10,6 +10,7 @@
   cmake,
   ncurses,
   pkg-config,
+  glslang,
   gcc-unwrapped,
   fontconfig,
   libGL,
@@ -80,6 +81,7 @@ in
       ++ lib.optionals stdenv.isLinux [
         cmake
         pkg-config
+        glslang
         autoPatchelfHook
       ];
 
