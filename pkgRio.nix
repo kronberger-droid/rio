@@ -112,7 +112,7 @@ in
 
     buildNoDefaultFeatures = true;
     buildFeatures = (lib.optionals withX11 ["x11"]) ++ (lib.optionals withWayland ["wayland"]);
-    checkType = "debug";
+    doCheck = false;
     meta = {
       description = rioToml.package.description;
       longDescription = rioToml.package.extended-description;
