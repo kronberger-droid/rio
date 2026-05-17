@@ -15,6 +15,11 @@ use crate::renderer::image_cache::ImageCache;
 use crate::Graphics;
 use compositor::{Compositor, Rect, Vertex};
 use rustc_hash::FxHashMap;
+// Only the macOS Metal path and the wgpu path use bare `mem::` (they
+// thread `mem::size_of::<Vertex>()` etc. into pipeline strides). The
+// Linux+no-wgpu Vulkan path uses `std::mem::` qualified directly and
+// doesn't need the import.
+#[cfg(any(target_os = "macos", feature = "wgpu"))]
 use std::mem;
 #[cfg(target_os = "macos")]
 use std::sync::Arc;
@@ -758,14 +763,27 @@ pub struct ImageInstance {
     pub source_rect: [f32; 4],
 }
 
-/// Which layer to render the image in (relative to text).
+/// Which layer to render the image in. Mirrors ghostty's
+/// three-bucket split (`renderer/image.zig:94-97`,
+/// `renderer/generic.zig:1647-1695`):
+///
+/// - `BelowBg`   — `z < BG_LIMIT`. Drawn before the cell-bg pass; sits
+///   underneath everything terminal-related.
+/// - `BelowText` — `BG_LIMIT ≤ z < 0`. Drawn between cell-bg and
+///   cell-text passes — the kitty default for "image with text on top".
+/// - `AboveText` — `z >= 0`. Drawn after the cell-text pass; sits on
+///   top of all glyphs.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ImageLayer {
-    /// z < 0: rendered before the text pipeline.
+    BelowBg,
     BelowText,
-    /// z >= 0: rendered after the text pipeline.
     AboveText,
 }
+
+/// Threshold separating `BelowBg` from `BelowText`. Matches ghostty's
+/// `bg_limit = std.math.minInt(i32) / 2` at
+/// `renderer/image.zig:377`.
+const IMAGE_BG_LIMIT: i32 = i32::MIN / 2;
 
 /// A single image draw command for the image pipeline.
 struct ImageDraw {
@@ -797,12 +815,27 @@ pub struct Renderer {
     /// Dedicated GPU texture for the background image, sized to the
     /// image dimensions instead of going through the glyph atlas.
     background_image_texture: Option<ImageTextureEntry>,
+    /// Metal swap-chain state. One semaphore + one frame index for
+    /// the whole renderer regardless of how many split-pane grids
+    /// exist — mirrors ghostty's `SwapChain` at
+    /// `renderer/generic.zig:247`. Each render acquires one permit,
+    /// advances the index, hands the index to every grid's
+    /// `render_bg_metal` / `render_text_metal`, and releases the
+    /// permit from the command-buffer completion handler.
+    #[cfg(target_os = "macos")]
+    metal_frame_permits: crate::grid::metal::FramePermits,
+    #[cfg(target_os = "macos")]
+    metal_frame_index: usize,
 }
 
 /// Upload `pixels` to a fresh GPU texture using whatever backend `context`
 /// is bound to. Mirrors the per-image upload in `render_graphic_overlays`,
 /// but produces a standalone `ImageTextureEntry` sized exactly to the image
 /// instead of consuming a slot in the glyph atlas.
+// Linux+no-wgpu: every match arm diverges (Cpu/Vulkan return early, Phantom
+// is unreachable!()), so `gpu` is uninhabited and the trailing `Some(...)`
+// is statically unreachable.
+#[allow(unused_variables, unreachable_code)]
 fn upload_background_image_texture(
     context: &mut crate::context::Context,
     pixels: &BackgroundImagePixels,
@@ -954,6 +987,10 @@ impl Renderer {
             image_draws: Vec::new(),
             background_image_dirty: None,
             background_image_texture: None,
+            #[cfg(target_os = "macos")]
+            metal_frame_permits: crate::grid::metal::new_frame_permits(),
+            #[cfg(target_os = "macos")]
+            metal_frame_index: 0,
         }
     }
 
@@ -984,7 +1021,7 @@ impl Renderer {
     pub fn prepare(
         &mut self,
         context: &mut crate::context::Context,
-        state: &crate::sugarloaf::state::SugarState,
+        _state: &crate::sugarloaf::state::SugarState,
         _graphics: &mut Graphics,
         image_data: &mut rustc_hash::FxHashMap<
             u32,
@@ -999,165 +1036,20 @@ impl Renderer {
         self.vertices.clear();
         self.draw_cmds.clear();
 
-        // Iterate over all content states and render visible ones.
-        // The Text arm is gone — rich-text emission replaced by
-        // `sugarloaf::text` (UI) and `grid_emit::build_row_fg`
-        // (terminal). The remaining arms are shape primitives the
-        // frontend still drives through `sugarloaf.rect()` etc.
-        for content_state in state.content.states.values() {
-            // Skip if marked for removal or hidden
-            if content_state.render_data.should_remove || content_state.render_data.hidden
-            {
-                continue;
-            }
+        // The per-id `Content.states` walk is gone — non-Text content
+        // arms (Rect/RoundedRect/Line/Triangle/Polygon/Arc/Image) had
+        // no rio caller passing `Some(id)`, so the Content registry
+        // never accumulated them. Immediate-mode primitives flow
+        // through `Renderer::rect/quad/...` straight into
+        // `comp.batches`; rich-text emission is handled by the grid
+        // pass and `sugarloaf::text`.
 
-            // Set clip_rect for this content element's bounds
-            self.comp.batches.clip_rect =
-                content_state.render_data.bounds.unwrap_or([0.0; 4]);
-
-            match &content_state.data {
-                crate::layout::ContentData::Text(_) => {
-                    // Rich-text Text content is inert — the builder
-                    // state is kept for panel font-size / dimensions
-                    // bookkeeping but no glyphs are emitted from it.
-                }
-                crate::layout::ContentData::Rect {
-                    x,
-                    y,
-                    width,
-                    height,
-                    color,
-                    depth,
-                } => {
-                    self.comp.batches.rect(
-                        &Rect::new(*x, *y, *width, *height),
-                        *depth,
-                        color,
-                        0,
-                    );
-                }
-                crate::layout::ContentData::RoundedRect {
-                    x,
-                    y,
-                    width,
-                    height,
-                    color,
-                    depth,
-                    border_radius,
-                } => {
-                    self.comp.batches.rounded_rect(
-                        &Rect::new(*x, *y, *width, *height),
-                        *depth,
-                        color,
-                        *border_radius,
-                        0,
-                    );
-                }
-                crate::layout::ContentData::Line {
-                    x1,
-                    y1,
-                    x2,
-                    y2,
-                    width,
-                    color,
-                    depth,
-                } => {
-                    self.comp
-                        .batches
-                        .add_line(*x1, *y1, *x2, *y2, *width, *depth, *color);
-                }
-                crate::layout::ContentData::Triangle {
-                    points,
-                    color,
-                    depth,
-                } => {
-                    self.comp.batches.add_triangle(
-                        points[0].0,
-                        points[0].1,
-                        points[1].0,
-                        points[1].1,
-                        points[2].0,
-                        points[2].1,
-                        *depth,
-                        *color,
-                    );
-                }
-                crate::layout::ContentData::Polygon {
-                    points,
-                    color,
-                    depth,
-                } => {
-                    self.comp
-                        .batches
-                        .add_polygon(points.as_slice(), *depth, *color);
-                }
-                crate::layout::ContentData::Arc {
-                    center_x,
-                    center_y,
-                    radius,
-                    start_angle,
-                    end_angle,
-                    stroke_width,
-                    color,
-                    depth,
-                } => {
-                    self.comp.batches.add_arc(
-                        *center_x,
-                        *center_y,
-                        *radius,
-                        *start_angle,
-                        *end_angle,
-                        *stroke_width,
-                        *depth,
-                        color,
-                    );
-                }
-                crate::layout::ContentData::Image {
-                    x,
-                    y,
-                    width,
-                    height,
-                    color,
-                    coords,
-                    depth,
-                    atlas_layer,
-                } => {
-                    self.comp.batches.add_image_rect(
-                        &Rect::new(*x, *y, *width, *height),
-                        *depth,
-                        color,
-                        coords,
-                        *atlas_layer,
-                    );
-                }
-            }
-        }
-
-        // Transient texts gone — previously rendered one-shot rich
-        // text overlays (welcome screen / dialog); migrated to
-        // `sugarloaf::text` immediate-mode primitive.
-
-        // Reset clip_rect after rendering all content
-        self.comp.batches.clip_rect = [0.0; 4];
-
-        // Image overlays come from the per-panel `image_overlays` map
-        // on `Sugarloaf`. Visibility filter: skip hidden panels so
-        // inactive-tab overlays don't bleed through. We still consult
-        // `state.content.states[id].render_data.hidden` for that —
-        // panel visibility bookkeeping lives in Content for now while
-        // the rest of the rich-text pipeline is being torn down.
-        let overlays: Vec<_> = image_overlays
-            .iter()
-            .filter(|(id, _)| {
-                state
-                    .content
-                    .states
-                    .get(id)
-                    .map(|cs| !cs.render_data.hidden)
-                    .unwrap_or(true)
-            })
-            .flat_map(|(_, v)| v.iter())
-            .collect();
+        // Image overlays: rio is responsible for not leaving stale
+        // overlays for hidden panels (callers `clear_image_overlays_for`
+        // on hide / panel removal). The renderer just drains whatever
+        // `image_overlays` currently holds.
+        let overlays: Vec<_> =
+            image_overlays.iter().flat_map(|(_, v)| v.iter()).collect();
         if !overlays.is_empty() {
             self.render_graphic_overlays(context, image_data, &overlays);
         } else {
@@ -1246,6 +1138,11 @@ impl Renderer {
     }
 
     /// Render image overlays using per-image GPU textures.
+    // Linux+no-wgpu: the kitty-upload match's wgpu/metal arms are
+    // cfg'd out; remaining arms (Cpu unreachable!, Vulkan unreachable!,
+    // Phantom continue) all diverge so `gpu` is uninhabited and the
+    // trailing `image_textures.insert(...)` is statically unreachable.
+    #[allow(unused_variables, unreachable_code)]
     #[inline]
     #[allow(clippy::too_many_arguments)]
     fn render_graphic_overlays(
@@ -1325,9 +1222,6 @@ impl Renderer {
                 crate::context::ContextType::Cpu(_) => unreachable!(),
                 #[cfg(target_os = "linux")]
                 crate::context::ContextType::Vulkan(_) => unreachable!(),
-                #[cfg(not(feature = "wgpu"))]
-                #[allow(unreachable_patterns)]
-                _ => continue,
                 #[cfg(feature = "wgpu")]
                 crate::context::ContextType::Wgpu(ctx) => {
                     let texture = ctx.device.create_texture(&wgpu::TextureDescriptor {
@@ -1402,6 +1296,15 @@ impl Renderer {
                     );
                     ImageTexture::Metal(mtl_tex)
                 }
+                // `_Phantom` is the lifetime-placeholder variant that
+                // only exists when wgpu is feature-gated out. Naming
+                // it explicitly (instead of `_ => continue`) forces
+                // the compiler to flag any future variant added to
+                // `ContextType` — a previous wildcard arm shadowed
+                // the platform arms above and silently dropped every
+                // kitty image upload on macOS+no-wgpu builds.
+                #[cfg(not(feature = "wgpu"))]
+                crate::context::ContextType::_Phantom(_) => continue,
             };
 
             self.image_textures.insert(
@@ -1426,7 +1329,9 @@ impl Renderer {
                     dest_size: [overlay.width, overlay.height],
                     source_rect: overlay.source_rect,
                 },
-                layer: if overlay.z_index < 0 {
+                layer: if overlay.z_index < IMAGE_BG_LIMIT {
+                    ImageLayer::BelowBg
+                } else if overlay.z_index < 0 {
                     ImageLayer::BelowText
                 } else {
                     ImageLayer::AboveText
@@ -1477,9 +1382,15 @@ impl Renderer {
                 Some(e) => e,
                 None => continue,
             };
+            // Without the `wgpu` feature `ImageTexture` only carries
+            // the `Metal` variant on macOS, so the match is
+            // infallible. Allow the clippy lint locally rather than
+            // splitting into two cfg branches; the Wgpu arm below is
+            // a real code path when the feature is on.
+            #[allow(clippy::infallible_destructuring_match)]
             let tex = match &img.gpu {
-                #[cfg(target_os = "macos")]
                 ImageTexture::Metal(tex) => tex,
+                #[cfg(feature = "wgpu")]
                 _ => continue,
             };
 
@@ -1532,8 +1443,12 @@ impl Renderer {
             Some(e) => e,
             None => return true,
         };
+        // See `draw_images_metal` for why this is `#[allow]`-ed +
+        // the Wgpu arm is feature-gated.
+        #[allow(clippy::infallible_destructuring_match)]
         let tex = match &entry.gpu {
             ImageTexture::Metal(tex) => tex,
+            #[cfg(feature = "wgpu")]
             _ => return true,
         };
 
@@ -2164,6 +2079,17 @@ impl Renderer {
             }
         };
 
+        // Acquire one swap-chain permit for the whole renderer.
+        // Blocks if 3 frames are already in flight — backpressure
+        // that keeps the CPU from outrunning the GPU. Mirrors
+        // ghostty's `SwapChain.nextFrame` at
+        // `renderer/generic.zig:295`. Single Arc, single permit, no
+        // matter how many split-pane grids the renderer is driving.
+        crate::grid::metal::acquire_frame_permit(&self.metal_frame_permits);
+        self.metal_frame_index =
+            (self.metal_frame_index + 1) % crate::grid::metal::FRAMES_IN_FLIGHT_PUB;
+        let frame = self.metal_frame_index;
+
         loop {
             let instance_buffer =
                 brush.instance_buffer_pool.lock().acquire(&context.device);
@@ -2232,17 +2158,31 @@ impl Renderer {
                 ) {
                     return false;
                 }
-                // Terminal grid passes — drawn after the window bg
-                // fill but before rich-text UI overlays, so each
-                // panel's cells composite over the window bg and
-                // under the tab-bar / assistant / search overlays.
                 true
             })();
-            if ok {
-                for (grid, uniforms) in grids.iter_mut() {
-                    grid.render_metal(render_encoder, uniforms);
-                }
-            }
+            // Three-bucket image z-ordering — mirrors ghostty's
+            // `renderer/generic.zig:1640-1695`:
+            //
+            //   bg fill / image (already drawn above)
+            //   ↓
+            //   kitty z < BG_LIMIT  (BelowBg)
+            //   ↓
+            //   grid bg pass (per panel)
+            //   ↓
+            //   kitty BG_LIMIT ≤ z < 0  (BelowText)
+            //   ↓
+            //   grid text pass (per panel)
+            //   ↓
+            //   kitty z >= 0  (AboveText)
+            //   ↓
+            //   rich-text UI overlays (brush.render)
+            //   ↓
+            //   UI text pass (labels)
+            //
+            // The two grid passes run inside a single iteration loop
+            // per panel — for multi-panel layouts the bg/text
+            // ordering is per-grid (one panel's text doesn't paint
+            // over another panel's bg image, and vice versa).
             let ok = ok
                 && (|| {
                     if has_images
@@ -2251,7 +2191,41 @@ impl Renderer {
                             &self.image_textures,
                             brush,
                             render_encoder,
+                            ImageLayer::BelowBg,
+                            &instance_buffer,
+                            &mut instance_offset,
+                            &globals,
+                        )
+                    {
+                        return false;
+                    }
+                    for (grid, uniforms) in grids.iter_mut() {
+                        grid.render_bg_metal(render_encoder, frame, uniforms);
+                    }
+                    if has_images
+                        && !Self::draw_images_metal(
+                            &self.image_draws,
+                            &self.image_textures,
+                            brush,
+                            render_encoder,
                             ImageLayer::BelowText,
+                            &instance_buffer,
+                            &mut instance_offset,
+                            &globals,
+                        )
+                    {
+                        return false;
+                    }
+                    for (grid, uniforms) in grids.iter_mut() {
+                        grid.render_text_metal(render_encoder, frame, uniforms);
+                    }
+                    if has_images
+                        && !Self::draw_images_metal(
+                            &self.image_draws,
+                            &self.image_textures,
+                            brush,
+                            render_encoder,
+                            ImageLayer::AboveText,
                             &instance_buffer,
                             &mut instance_offset,
                             &globals,
@@ -2269,20 +2243,6 @@ impl Renderer {
                         &instance_buffer,
                         &mut instance_offset,
                     ) {
-                        return false;
-                    }
-                    if has_images
-                        && !Self::draw_images_metal(
-                            &self.image_draws,
-                            &self.image_textures,
-                            brush,
-                            render_encoder,
-                            ImageLayer::AboveText,
-                            &instance_buffer,
-                            &mut instance_offset,
-                            &globals,
-                        )
-                    {
                         return false;
                     }
                     // UI text pass. Lazy-init on the first frame with
@@ -2312,6 +2272,10 @@ impl Renderer {
                          dropping frame",
                         prev
                     );
+                    // No completion handler will fire to release the
+                    // swap-chain permit we acquired above — release
+                    // it here so the next frame can run.
+                    crate::grid::metal::release_frame_permit(&self.metal_frame_permits);
                     return;
                 }
                 tracing::info!(
@@ -2324,15 +2288,20 @@ impl Renderer {
 
             render_encoder.end_encoding();
 
-            // Completion handler returns the buffer to the pool on GPU
-            // finish. The block fires on a Metal-internal thread; we
-            // hop into the pool's mutex to release.
+            // Completion handler returns the buffer to the pool +
+            // releases the swap-chain permit on GPU finish. The block
+            // fires on a Metal-internal thread; the `FramePermits`
+            // Arc inside the closure hops into its condvar to wake
+            // any frame waiting on `acquire_frame_permit`. One Arc
+            // clone per render — no per-grid duplication.
             let pool = brush.instance_buffer_pool.clone();
             let buffer_cell = StdCell::new(Some(instance_buffer));
+            let permits = self.metal_frame_permits.clone();
             let block = ConcreteBlock::new(move |_cb: &metal::CommandBufferRef| {
                 if let Some(b) = buffer_cell.take() {
                     pool.lock().release(b);
                 }
+                crate::grid::metal::release_frame_permit(&permits);
             })
             .copy();
             command_buffer.add_completed_handler(&block);
@@ -2391,6 +2360,11 @@ impl Renderer {
     /// Glyph atlas sampling through this pipeline isn't ported —
     /// grid text + UI text overlay each own dedicated atlas
     /// pipelines, so the rich-text path doesn't need it.
+    // `if let ImageTexture::Vulkan(...)` is irrefutable on Linux+no-wgpu
+    // because that's the only variant compiled in (Wgpu / Metal arms
+    // are cfg'd out). Keeping the `if let` form so the same code stays
+    // valid when wgpu support is enabled.
+    #[allow(irrefutable_let_patterns)]
     #[cfg(target_os = "linux")]
     pub fn render_vulkan(
         &mut self,

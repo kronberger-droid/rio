@@ -124,7 +124,10 @@ pub(crate) fn resolve_with(
     // discovery (CoreText on macOS, fontconfig on Linux, font-kit walk
     // on Windows) and registers the discovered font on first miss so
     // subsequent codepoints in the same script hit the fast path.
-    let (font_id, is_emoji) = font_lib.resolve_font_for_char(ch, &style);
+    // No route context here — this cache is for layout/width measurement,
+    // not pane rendering. PUA codepoints fall through to the regular
+    // font lookup, which returns a sensible width.
+    let (font_id, is_emoji) = font_lib.resolve_font_for_char(ch, &style, None);
 
     if is_emoji {
         width = 2.0;
@@ -169,7 +172,7 @@ pub(crate) fn compute_advance(
     font_id: usize,
     ch: char,
 ) -> Option<AdvanceInfo> {
-    let font = font_ctx.inner.get(&font_id)?;
+    let font = font_ctx.try_get(&font_id)?;
     let handle = if let Some(path) = font.path() {
         crate::font::macos::FontHandle::from_path(path)
     } else if let Some(bytes) = font.data() {

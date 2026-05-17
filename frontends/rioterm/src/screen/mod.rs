@@ -100,6 +100,18 @@ pub struct ScreenWindowProperties {
     pub window_id: rio_window::window::WindowId,
 }
 
+/// Whether the render surface should run in macOS compositor's
+/// opaque-window fast path. Non-opaque iff the user actually
+/// configured transparency (`window.opacity < 1`) or a glass
+/// background effect — system blur on its own is not enough, since
+/// without `opacity < 1` there's nothing transparent for the blur to
+/// read through, so we keep the fast path for that case. Default =
+/// opaque.
+#[inline]
+fn window_should_be_opaque(config: &rio_backend::config::Config) -> bool {
+    config.window.opacity >= 1.0 && !config.window.blur.is_glass()
+}
+
 impl Screen<'_> {
     pub fn new<'screen>(
         window_properties: ScreenWindowProperties,
@@ -141,41 +153,7 @@ impl Screen<'_> {
             SugarloafBackend::Cpu
         } else {
             match config.renderer.backend {
-                Backend::Automatic => {
-                    // Linux + macOS pick their native GPU backend (ash
-                    // / Metal). Other targets fall back to the wgpu
-                    // umbrella (only available with the `wgpu`
-                    // feature; otherwise we degrade to CPU rasterizer).
-                    #[cfg(target_os = "linux")]
-                    {
-                        SugarloafBackend::Vulkan
-                    }
-                    #[cfg(target_os = "macos")]
-                    {
-                        SugarloafBackend::Metal
-                    }
-                    #[cfg(all(
-                        not(any(target_os = "linux", target_os = "macos")),
-                        feature = "wgpu",
-                    ))]
-                    {
-                        #[cfg(target_arch = "wasm32")]
-                        let default_backend =
-                            wgpu::Backends::BROWSER_WEBGPU | wgpu::Backends::GL;
-                        #[cfg(not(target_arch = "wasm32"))]
-                        let default_backend = wgpu::Backends::all();
-
-                        SugarloafBackend::Wgpu(default_backend)
-                    }
-                    #[cfg(all(
-                        not(any(target_os = "linux", target_os = "macos")),
-                        not(feature = "wgpu"),
-                    ))]
-                    {
-                        SugarloafBackend::Cpu
-                    }
-                }
-                // `Backend::Vulkan` from the user config now means the
+                // `Backend::Vulkan` from the user config means the
                 // native ash backend on Linux. Other OSes fall through
                 // to the wgpu Vulkan path when the `wgpu` feature is
                 // on; otherwise we degrade to CPU rasterizer.
@@ -185,20 +163,16 @@ impl Screen<'_> {
                 Backend::Vulkan => SugarloafBackend::Wgpu(wgpu::Backends::VULKAN),
                 #[cfg(all(not(target_os = "linux"), not(feature = "wgpu")))]
                 Backend::Vulkan => SugarloafBackend::Cpu,
-                #[cfg(feature = "wgpu")]
-                Backend::GL => SugarloafBackend::Wgpu(wgpu::Backends::GL),
-                #[cfg(not(feature = "wgpu"))]
-                Backend::GL => SugarloafBackend::Cpu,
-                #[cfg(feature = "wgpu")]
-                Backend::WgpuMetal => SugarloafBackend::Wgpu(wgpu::Backends::METAL),
-                #[cfg(not(feature = "wgpu"))]
-                Backend::WgpuMetal => SugarloafBackend::Cpu,
                 #[cfg(target_os = "macos")]
                 Backend::Metal => SugarloafBackend::Metal,
-                #[cfg(feature = "wgpu")]
-                Backend::DX12 => SugarloafBackend::Wgpu(wgpu::Backends::DX12),
+                #[cfg(all(feature = "wgpu", target_arch = "wasm32"))]
+                Backend::Webgpu => SugarloafBackend::Wgpu(
+                    wgpu::Backends::BROWSER_WEBGPU | wgpu::Backends::GL,
+                ),
+                #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+                Backend::Webgpu => SugarloafBackend::Wgpu(wgpu::Backends::all()),
                 #[cfg(not(feature = "wgpu"))]
-                Backend::DX12 => SugarloafBackend::Cpu,
+                Backend::Webgpu => SugarloafBackend::Cpu,
             }
         };
 
@@ -256,10 +230,11 @@ impl Screen<'_> {
             scrollback_history_limit: config.scrollback_history_limit,
         };
 
-        // Create rich text with initial position accounting for island
+        // Allocate a rich_text_id for the new panel. Sugarloaf no
+        // longer tracks per-id panel metadata — position/bounds live
+        // on `ContextDimension` via rio's layout system; the id is
+        // still useful as a key for image_overlays + grid renderers.
         let rich_text_id = next_rich_text_id();
-        let _ = sugarloaf.text(Some(rich_text_id));
-        sugarloaf.set_position(rich_text_id, config.margin.left, padding_y_top);
 
         // Create unscaled margin for ContextDimension (compute() will scale it)
         let margin = Margin::new(
@@ -275,13 +250,18 @@ impl Screen<'_> {
             padding_y_bottom * scale as f32,
             config.margin.left * scale as f32,
         );
+        let (text_dimensions, cell_metrics) = sugarloaf.compute_cell_metrics(
+            config.fonts.size,
+            config.line_height,
+            scale as f32,
+        );
         let context_dimension = ContextDimension::build(
             size.width as f32,
             size.height as f32,
-            sugarloaf
-                .get_text_dimensions(&rich_text_id)
-                .unwrap_or_default(),
+            text_dimensions,
+            cell_metrics,
             config.line_height,
+            config.fonts.size,
             margin,
         );
 
@@ -304,6 +284,13 @@ impl Screen<'_> {
             scaled_margin,
             sugarloaf_errors,
         )?;
+
+        // Window is opaque (compositor fast path) unless the user
+        // actually configured transparency. The render surface can
+        // hold per-pixel alpha either way — see `cell_bg` in
+        // `grid_emit.rs` — but flipping the layer to non-opaque is
+        // what makes the OS treat those alpha bits as see-through.
+        sugarloaf.set_window_opaque(window_should_be_opaque(config));
 
         sugarloaf.set_background_color(Some(renderer.dynamic_background.1));
 
@@ -370,6 +357,9 @@ impl Screen<'_> {
     #[allow(dead_code)]
     pub fn drop_grid(&mut self, route_id: usize) {
         self.grids.remove(&route_id);
+        // The per-context viewport buffers (visible_rows, cell_styles,
+        // extras_table) live on `RenderableContent` and drop with the
+        // context itself.
     }
 
     #[inline]
@@ -437,7 +427,9 @@ impl Screen<'_> {
         let current_grid = self.context_manager.current_grid();
         let (context, margin) = current_grid.current_context_with_computed_dimension();
         let context_dimension = context.dimension;
-        let style = self.sugarloaf.style();
+        // Canonical integer cell stride — `cell.cell_height` already
+        // has line_height baked in by sugarloaf, do NOT re-multiply.
+        // Single source of truth shared with the GPU grid uniform.
         calculate_mouse_position(
             &self.mouse,
             display_offset,
@@ -445,8 +437,8 @@ impl Screen<'_> {
             margin.left,
             margin.top,
             (
-                context_dimension.dimension.width,
-                context_dimension.dimension.height * style.line_height,
+                context_dimension.cell.cell_width,
+                context_dimension.cell.cell_height,
             ),
         )
     }
@@ -507,15 +499,17 @@ impl Screen<'_> {
                 config.margin.left * scale,
             ));
 
-            // Update font size and line height BEFORE update_dimensions
+            // Update per-panel font size and line height BEFORE
+            // update_dimensions — the recompute reads from these
+            // fields. `rebaseline_font_size` also re-anchors the
+            // "reset" target so the next change_font_size(Reset)
+            // returns to the new config size.
             for current_context in context_grid.contexts_mut().values_mut() {
                 let current_context = current_context.context_mut();
-                self.sugarloaf
-                    .set_text_font_size(&current_context.rich_text_id, config.fonts.size);
-                self.sugarloaf.set_text_line_height(
-                    &current_context.rich_text_id,
-                    current_context.dimension.line_height,
-                );
+                current_context
+                    .dimension
+                    .rebaseline_font_size(config.fonts.size);
+                current_context.dimension.line_height = config.line_height;
             }
 
             context_grid.update_dimensions(&mut self.sugarloaf);
@@ -539,6 +533,11 @@ impl Screen<'_> {
         // Update keyboard config in context manager
         self.context_manager.config.keyboard = config.keyboard;
 
+        // Re-evaluate the opaque flag — toggling `window.opacity` /
+        // `window.blur` at runtime should flip the compositor mode.
+        self.sugarloaf
+            .set_window_opaque(window_should_be_opaque(config));
+
         self.sugarloaf
             .set_background_color(Some(self.renderer.dynamic_background.1));
 
@@ -558,16 +557,15 @@ impl Screen<'_> {
 
     #[inline]
     pub fn change_font_size(&mut self, action: FontSizeAction) {
-        let action: u8 = match action {
-            FontSizeAction::Increase => 2,
-            FontSizeAction::Decrease => 1,
-            FontSizeAction::Reset => 0,
+        let dim = &mut self.context_manager.current_mut().dimension;
+        let changed = match action {
+            FontSizeAction::Increase => dim.increase_font_size(),
+            FontSizeAction::Decrease => dim.decrease_font_size(),
+            FontSizeAction::Reset => dim.reset_font_size(),
         };
-
-        self.sugarloaf.set_text_font_size_action(
-            &self.context_manager.current().rich_text_id,
-            action,
-        );
+        if !changed {
+            return;
+        }
 
         self.context_manager
             .current_grid_mut()
@@ -606,16 +604,37 @@ impl Screen<'_> {
     ) -> &mut Self {
         self.sugarloaf.rescale(new_scale);
         self.sugarloaf.resize(new_size.width, new_size.height);
-        self.mark_dirty();
-        self.resize_all_contexts();
-        self.context_manager
-            .current_grid_mut()
-            .update_dimensions(&mut self.sugarloaf);
+
+        for context_grid in self.context_manager.contexts_mut() {
+            let old_scale = context_grid.current().dimension.dimension.scale.max(1.0);
+            let scaled_margin = context_grid.scaled_margin;
+            let unscaled_margin = Margin::new(
+                scaled_margin.top / old_scale,
+                scaled_margin.right / old_scale,
+                scaled_margin.bottom / old_scale,
+                scaled_margin.left / old_scale,
+            );
+
+            context_grid.update_scaled_margin(Margin::new(
+                unscaled_margin.top * new_scale,
+                unscaled_margin.right * new_scale,
+                unscaled_margin.bottom * new_scale,
+                unscaled_margin.left * new_scale,
+            ));
+
+            for context in context_grid.contexts_mut().values_mut() {
+                context.context_mut().dimension.update_scale(new_scale);
+            }
+
+            context_grid.update_dimensions(&mut self.sugarloaf);
+        }
+
         let width = new_size.width as f32;
         let height = new_size.height as f32;
 
         self.context_manager
             .resize_all_grids(width, height, &mut self.sugarloaf);
+        self.mark_dirty();
 
         self
     }
@@ -1416,13 +1435,12 @@ impl Screen<'_> {
     }
 
     pub fn split_right_with_config(&mut self, config: rio_backend::config::Config) {
-        // Create rich text with initial position accounting for island
-        let padding_y_top = self.renderer.margin.top
+        // Allocate panel id; position lands on `ContextDimension`
+        // through the Taffy layout pass (`apply_taffy_layout`).
+        let _ = self.renderer.margin.top
             + self.renderer.island.as_ref().map_or(0.0, |i| i.height());
+        let _ = config.margin.left;
         let rich_text_id = next_rich_text_id();
-        let _ = self.sugarloaf.text(Some(rich_text_id));
-        self.sugarloaf
-            .set_position(rich_text_id, config.margin.left, padding_y_top);
         self.context_manager.split_from_config(
             rich_text_id,
             false,
@@ -1434,16 +1452,7 @@ impl Screen<'_> {
     }
 
     pub fn split_right(&mut self) {
-        // Create rich text with initial position accounting for island
-        let current_grid = self.context_manager.current_grid();
-        let (_context, margin) = current_grid.current_context_with_computed_dimension();
-        let padding_x = margin.left;
-        let padding_y_top = self.renderer.margin.top
-            + self.renderer.island.as_ref().map_or(0.0, |i| i.height());
         let rich_text_id = next_rich_text_id();
-        let _ = self.sugarloaf.text(Some(rich_text_id));
-        self.sugarloaf
-            .set_position(rich_text_id, padding_x, padding_y_top);
         self.context_manager
             .split(rich_text_id, false, &mut self.sugarloaf);
 
@@ -1451,16 +1460,7 @@ impl Screen<'_> {
     }
 
     pub fn split_down(&mut self) {
-        // Create rich text with initial position accounting for island
-        let current_grid = self.context_manager.current_grid();
-        let (_context, margin) = current_grid.current_context_with_computed_dimension();
-        let padding_x = margin.left;
-        let padding_y_top = self.renderer.margin.top
-            + self.renderer.island.as_ref().map_or(0.0, |i| i.height());
         let rich_text_id = next_rich_text_id();
-        let _ = self.sugarloaf.text(Some(rich_text_id));
-        self.sugarloaf
-            .set_position(rich_text_id, padding_x, padding_y_top);
         self.context_manager
             .split(rich_text_id, true, &mut self.sugarloaf);
 
@@ -1522,15 +1522,12 @@ impl Screen<'_> {
         self.context_manager.contexts_mut()[old_index]
             .update_dimensions(&mut self.sugarloaf);
 
-        // Use the base scaled_margin for the new tab position, not the
-        // split-panel-aware margin, because the new tab is full-window.
-        let padding_x = self.context_manager.current_grid().scaled_margin.left;
-        let padding_y_top = self.renderer.margin.top
+        // Allocate panel id; the layout pass handles positioning via
+        // `ContextDimension` once the new tab's grid is built.
+        let _ = self.context_manager.current_grid().scaled_margin.left;
+        let _ = self.renderer.margin.top
             + self.renderer.island.as_ref().map_or(0.0, |i| i.height());
         let rich_text_id = next_rich_text_id();
-        let _ = self.sugarloaf.text(Some(rich_text_id));
-        self.sugarloaf
-            .set_position(rich_text_id, padding_x, padding_y_top);
         self.context_manager.add_context(redirect, rich_text_id);
         let new_index = self.context_manager.current_index();
         self.context_manager.switch_context_visibility(
@@ -1593,13 +1590,11 @@ impl Screen<'_> {
         if previous_margin.top != padding_y_top
             || previous_margin.bottom != padding_y_bottom
         {
-            if let Some(layout) = self
-                .sugarloaf
-                .get_text_layout(&self.context_manager.current().rich_text_id)
-            {
+            let current_dim = self.context_manager.current().dimension;
+            if current_dim.font_size > 0.0 {
                 let s = self.sugarloaf.style_mut();
-                s.font_size = layout.font_size;
-                s.line_height = layout.line_height;
+                s.font_size = current_dim.font_size;
+                s.line_height = current_dim.line_height;
 
                 let scale = self.sugarloaf.scale_factor();
                 let d = self.context_manager.current_grid_mut();
@@ -2252,10 +2247,11 @@ impl Screen<'_> {
         let current_grid = self.context_manager.current_grid();
         let (context, margin) = current_grid.current_context_with_computed_dimension();
         let layout = context.dimension;
-        // All values in physical pixels — margin is pre-scaled, cell
-        // dimensions are in physical pixels, position.y is physical.
-        let cell_height =
-            (layout.dimension.height * self.sugarloaf.style().line_height) as f64;
+        // Canonical integer cell stride. line_height is already
+        // baked into `cell.cell_height`; the previous code
+        // multiplied by line_height again, breaking the
+        // edge-of-viewport detection at line_height ≠ 1.0.
+        let cell_height = layout.cell.cell_height as f64;
         let text_area_top = margin.top as f64;
         let text_area_bottom = text_area_top + layout.lines as f64 * cell_height;
         let window_height = self.sugarloaf.window_size().height as f64;
@@ -2294,21 +2290,25 @@ impl Screen<'_> {
     }
 
     #[inline]
-    pub fn contains_point(&self, x: usize, y: usize) -> bool {
+    pub fn contains_point(&self, x: f64, y: f64) -> bool {
         let current_grid = self.context_manager.current_grid();
         let (context, margin) = current_grid.current_context_with_computed_dimension();
         let layout = context.dimension;
-        // Margin is already pre-scaled (physical pixels), same as x/y.
-        let cell_width = layout.dimension.width;
-        let cell_height = layout.dimension.height * self.sugarloaf.style().line_height;
-        x > margin.left as usize
-            && x <= (margin.left + layout.columns as f32 * cell_width) as usize
-            && y > margin.top as usize
-            && y <= (margin.top + layout.lines as f32 * cell_height) as usize
+        // Canonical integer stride — same as the GPU paints with.
+        // line_height is already baked into `cell.cell_height`; do
+        // NOT multiply again here.
+        let cell_w = layout.cell.cell_width as f64;
+        let cell_h = layout.cell.cell_height as f64;
+        let left = margin.left as f64;
+        let top = margin.top as f64;
+        x > left
+            && x <= left + layout.columns as f64 * cell_w
+            && y > top
+            && y <= top + layout.lines as f64 * cell_h
     }
 
     #[inline]
-    pub fn side_by_pos(&self, x: usize) -> Side {
+    pub fn side_by_pos(&self, x: f64) -> Side {
         let current_grid = self.context_manager.current_grid();
         let (_, margin) = current_grid.current_context_with_computed_dimension();
         let current_context = self.context_manager.current();
@@ -2317,7 +2317,7 @@ impl Screen<'_> {
         crate::mouse::calculate_side_by_pos(
             x,
             margin.left,
-            layout.dimension.width,
+            layout.cell.cell_width,
             layout.width,
         )
     }
@@ -2613,12 +2613,16 @@ impl Screen<'_> {
 
         use crate::renderer::island::ISLAND_HEIGHT;
         let scale_factor = self.sugarloaf.scale_factor();
-        let island_height_px = (ISLAND_HEIGHT * scale_factor) as usize;
+        let island_height_px = (ISLAND_HEIGHT * scale_factor) as f64;
 
         let window_width = self.sugarloaf.window_size().width;
         let num_tabs = self.context_manager.len();
+        let island_visible = self.renderer.navigation.island_visible(num_tabs);
 
-        // Check if the color picker is open and the click hits a swatch
+        // Check if the color picker is open and the click hits a swatch.
+        // Handled before the `island_visible` short-circuit so a picker
+        // left open across a tab-close (hide_if_single trip) can still
+        // be dismissed by clicking its swatches.
         if let Some(ref mut island) = self.renderer.island {
             if island.is_color_picker_open() {
                 let consumed = island.handle_color_picker_click(
@@ -2644,6 +2648,13 @@ impl Screen<'_> {
                     self.mark_dirty();
                 }
             }
+            return false;
+        }
+
+        // Island isn't painted (hide_if_single + single tab on macOS).
+        // Nothing to click on, so let the caller route the event to the
+        // grid for selection / double-click maximize at the OS title bar.
+        if !island_visible {
             return false;
         }
 
@@ -3134,15 +3145,9 @@ impl Screen<'_> {
 
     #[inline]
     pub fn scroll(&mut self, new_scroll_x_px: f64, new_scroll_y_px: f64) {
-        let layout = match self
-            .sugarloaf
-            .get_text_layout(&self.context_manager.current().rich_text_id)
-        {
-            Some(l) => l,
-            None => return,
-        };
-        let width = layout.dimensions.width as f64;
-        let height = layout.dimensions.height as f64;
+        let dim = self.context_manager.current().dimension.dimension;
+        let width = dim.width as f64;
+        let height = dim.height as f64;
         let mode = self.get_mode();
 
         const MOUSE_WHEEL_UP: u8 = 64;
@@ -3187,9 +3192,7 @@ impl Screen<'_> {
             let line_cmd = if new_scroll_y_px > 0. { b'A' } else { b'B' };
             let column_cmd = if new_scroll_x_px > 0. { b'D' } else { b'C' };
 
-            let lines = (self.mouse.accumulated_scroll.y
-                / (layout.dimensions.height) as f64)
-                .abs() as usize;
+            let lines = (self.mouse.accumulated_scroll.y / height).abs() as usize;
 
             let columns = (self.mouse.accumulated_scroll.x / width).abs() as usize;
 
@@ -3213,8 +3216,7 @@ impl Screen<'_> {
         } else {
             self.mouse.accumulated_scroll.y +=
                 (new_scroll_y_px * self.mouse.multiplier) / self.mouse.divider;
-            let lines = (self.mouse.accumulated_scroll.y
-                / layout.dimensions.height as f64) as i32;
+            let lines = (self.mouse.accumulated_scroll.y / height) as i32;
 
             if lines != 0 {
                 let current = self.context_manager.current_mut();
@@ -3460,11 +3462,9 @@ impl Screen<'_> {
             }
         }
 
-        let (window_update, any_panel_dirty) = self.renderer.run(
-            &mut self.sugarloaf,
-            &mut self.context_manager,
-            &self.search_state.focused_match,
-        );
+        let (window_update, any_panel_dirty) = self
+            .renderer
+            .run(&mut self.sugarloaf, &mut self.context_manager);
         let has_animation = self.renderer.needs_redraw();
         let should_present = any_panel_dirty || has_animation;
 
@@ -3484,9 +3484,10 @@ impl Screen<'_> {
 
             if let Some(current_item) = current_grid.current_item() {
                 let layout = current_item.val.dimension;
-                let cell_width = layout.dimension.width;
-                let line_height = self.sugarloaf.style().line_height;
-                let cell_height = layout.dimension.height * line_height;
+                // Canonical integer stride — same value the GPU
+                // shader uses; line_height is already baked in.
+                let cell_width = layout.cell.cell_width as f32;
+                let cell_height = layout.cell.cell_height as f32;
                 let scale_factor = self.sugarloaf.scale_factor();
 
                 let panel_rect = current_item.layout_rect;
@@ -3530,9 +3531,7 @@ impl Screen<'_> {
         // - `damage == Partial(lines)`:
         // rebuild only those rows.
         // Unchanged rows keep their CellBg + CellText resident in
-        // the grid's CPU state, which is re-uploaded verbatim. Same
-        // pattern as `.partial` path at
-        // `ghostty/src/renderer/generic.zig:2431-2440`.
+        // the grid's CPU state, which is re-uploaded verbatim.
         {
             struct PanelFrame {
                 route_id: usize,
@@ -3547,7 +3546,19 @@ impl Screen<'_> {
                         rio_backend::crosswords::square::Square,
                     >,
                 >,
-                style_set: rio_backend::crosswords::style::StyleSet,
+                /// Per-cell resolved styles, flat row-major (length =
+                /// `cols * rows`). Materialized under the terminal
+                /// lock by walking visible cells and resolving
+                /// `style_id → Style` once per cell. Post-unlock the
+                /// renderer reads styles purely from this slab; no
+                /// reference back to the live grid's intern table.
+                cell_styles: Vec<rio_backend::crosswords::style::Style>,
+                /// Snapshot of the grid's extras table — needed to hash
+                /// per-cell zero-width combining codepoints into the run
+                /// shape key so cells with the same base codepoint but
+                /// different combining marks don't alias in the cache.
+                extras:
+                    rustc_hash::FxHashMap<u16, rio_backend::crosswords::square::Extras>,
                 term_colors: rio_backend::config::colors::term::TermColors,
                 cursor_col: u16,
                 cursor_row: u16,
@@ -3588,9 +3599,7 @@ impl Screen<'_> {
                 /// Search-hint matches for this panel. `None` when
                 /// search is inactive. Consumed alongside `selection`
                 /// inside `build_row_bg` / `build_row_fg` to apply
-                /// `search_match_background` / `_foreground`. Mirrors
-                /// `row_data.highlights` at
-                /// `ghostty/src/renderer/generic.zig:1317`.
+                /// `search_match_background` / `_foreground`.
                 hint_matches: Option<Vec<rio_backend::crosswords::search::Match>>,
                 /// Currently-focused search match (↑/↓ navigation).
                 /// Rendered with `search_focused_match_background` /
@@ -3625,43 +3634,47 @@ impl Screen<'_> {
             {
                 let ctx = &mut item.val;
                 let dim = ctx.dimension;
-                // Snap to integer pixel cells. `dim.dimension.width`
-                // comes from `char_width * scale` (fractional);
-                // `dim.dimension.height` is already `.ceil()`'d in
-                // sugarloaf's layout. Mixed fractional widths drift
-                // the bg fragment's `floor((pixel - padding) /
-                // cell_size)` across cell boundaries — adjacent
-                // columns end up 7 vs 8 px wide → visible seams.
-                // Rounding both to the same integer stride the cell
-                // grid is actually drawn on removes the drift.
-                let cell_w = dim.dimension.width.round().max(1.0);
-                let cell_h = dim.dimension.height.round().max(1.0);
-                // Per-panel font size (zoom is per-rich-text, not root).
-                // Falls back to root × scale if the text id can't be
-                // found — shouldn't happen post-init but keeps the emit
-                // loop from dividing by zero.
-                let font_px = self
-                    .sugarloaf
-                    .text_scaled_font_size(&ctx.rich_text_id)
-                    .unwrap_or_else(|| {
-                        let s = self.sugarloaf.style();
-                        s.font_size * s.scale_factor
-                    });
-                let (visible_rows, style_set, term_colors, display_offset) = {
-                    let terminal = ctx.terminal.lock();
-                    (
-                        terminal.visible_rows(),
-                        terminal.grid.style_set.clone(),
-                        terminal.colors,
-                        terminal.display_offset() as i32,
-                    )
+                // Canonical integer cell stride — single source of
+                // truth for paint, layout, and mouse hit-test. The
+                // bg fragment shader does
+                // `floor((pixel - padding) / cell_size)` and the text
+                // vertex multiplies `grid_pos * cell_size`, so both
+                // sides must agree on the same integer stride or
+                // adjacent columns drift to 7 vs 8 px wide and seams
+                // show up.
+                let cell_w = dim.cell.cell_width as f32;
+                let cell_h = dim.cell.cell_height as f32;
+                // Per-panel font size lives on `ContextDimension` since
+                // the panel-state migration; sugarloaf is no longer
+                // consulted. Per-panel zoom mutates
+                // `dim.scaled_font_size` directly.
+                let font_px = if dim.scaled_font_size > 0.0 {
+                    dim.scaled_font_size
+                } else {
+                    let s = self.sugarloaf.style();
+                    s.font_size * s.scale_factor
                 };
+                // The viewport snapshot was already taken by
+                // `Renderer::run` for this context: visible rows,
+                // per-cell styles, extras table, term colors, and
+                // display offset all live on `ctx.renderable_content`.
+                // No second terminal lock and no second materialize —
+                // we take ownership of the buffers via `mem::take`
+                // and put them back at the end of the render pass so
+                // the next frame's `Renderer::run` resumes the same
+                // allocations.
+                let visible_rows =
+                    std::mem::take(&mut ctx.renderable_content.visible_rows);
+                let cell_styles = std::mem::take(&mut ctx.renderable_content.cell_styles);
+                let extras = std::mem::take(&mut ctx.renderable_content.extras);
+                let term_colors = ctx.renderable_content.term_colors;
+                let display_offset = ctx.renderable_content.display_offset as i32;
                 let selection = ctx.renderable_content.selection_range;
                 let cursor = &ctx.renderable_content.cursor;
                 // Take + reset so next frame sees fresh damage only
                 // from this frame's `Renderer::run`.
                 let damage = std::mem::replace(
-                    &mut ctx.renderable_content.last_frame_damage,
+                    &mut ctx.renderable_content.frame_damage,
                     rio_backend::event::TerminalDamage::Noop,
                 );
                 let hint_matches = ctx.renderable_content.hint_matches.clone();
@@ -3700,16 +3713,26 @@ impl Screen<'_> {
                 let cursor_color = term_colors
                     [rio_backend::config::colors::NamedColor::Cursor as usize]
                     .unwrap_or(self.renderer.named_colors.cursor);
+                // `dim` (`ContextDimension`) is mutated by the resize
+                // event handler outside the terminal lock, so it can
+                // race ahead of the snapshot. `renderable_content.columns`
+                // / `screen_lines` are captured under the same lock as
+                // `visible_rows` / `cell_styles` (see `Renderer::run`),
+                // so reading from there keeps the row widths consistent
+                // with the painted data — without this, a resize landing
+                // between snapshot and panel-build OOBs `cell_styles` at
+                // `grid_emit.rs:965` (issue #1593).
                 panels.push(PanelFrame {
                     route_id: ctx.route_id,
                     layout_rect: item.layout_rect,
-                    cols: dim.columns.max(1) as u32,
-                    rows: dim.lines.max(1) as u32,
+                    cols: ctx.renderable_content.columns.max(1) as u32,
+                    rows: ctx.renderable_content.screen_lines.max(1) as u32,
                     cell_w,
                     cell_h,
                     font_px,
                     visible_rows,
-                    style_set,
+                    cell_styles,
+                    extras,
                     term_colors,
                     cursor_col: cursor.state.pos.col.0 as u16,
                     cursor_row: cursor.state.pos.row.0 as u16,
@@ -3753,7 +3776,7 @@ impl Screen<'_> {
             let rasterizer = &mut self.grid_rasterizer;
             let renderer_ref = &self.renderer;
             for (route_id, grid) in self.grids.iter_mut() {
-                let Some(p) = panels.iter().find(|p| p.route_id == *route_id) else {
+                let Some(p) = panels.iter_mut().find(|p| p.route_id == *route_id) else {
                     continue;
                 };
 
@@ -3772,22 +3795,20 @@ impl Screen<'_> {
                 let force_full = grid.needs_full_rebuild()
                     || matches!(p.damage, rio_backend::event::TerminalDamage::Full);
 
-                enum RowsToRebuild<'a> {
+                enum RowsToRebuild {
                     None,
                     All,
-                    Only(
-                        &'a std::collections::BTreeSet<
-                            rio_backend::crosswords::LineDamage,
-                        >,
-                    ),
+                    /// Per-row decision: walk `visible_rows` and
+                    /// rebuild rows whose `dirty` bit is set.
+                    Dirty,
                 }
                 let rows_to_rebuild = if force_full {
                     RowsToRebuild::All
                 } else {
-                    match &p.damage {
+                    match p.damage {
                         rio_backend::event::TerminalDamage::Full => RowsToRebuild::All,
-                        rio_backend::event::TerminalDamage::Partial(lines) => {
-                            RowsToRebuild::Only(lines)
+                        rio_backend::event::TerminalDamage::Partial => {
+                            RowsToRebuild::Dirty
                         }
                         rio_backend::event::TerminalDamage::CursorOnly
                         | rio_backend::event::TerminalDamage::Noop => RowsToRebuild::None,
@@ -3811,59 +3832,73 @@ impl Screen<'_> {
                 // never needs shaping so it runs on all platforms;
                 // the fg path is macOS-specific pending the
                 // wgpu+swash port.
-                let hint_matches_slice = p.hint_matches.as_deref();
-                let focused_match_ref = p.focused_match.as_ref();
-                let hovered_hyperlink = p.hovered_hyperlink;
-                let mut rebuild_row = |y: usize,
-                                       grid: &mut rio_backend::sugarloaf::grid::GridRenderer,
-                                       rasterizer: &mut crate::grid_emit::GridGlyphRasterizer| {
-                    let Some(row) = p.visible_rows.get(y) else {
-                        return;
+                let mut rebuild_row =
+                    |p: &PanelFrame,
+                     y: usize,
+                     grid: &mut rio_backend::sugarloaf::grid::GridRenderer,
+                     rasterizer: &mut crate::grid_emit::GridGlyphRasterizer| {
+                        let Some(row) = p.visible_rows.get(y) else {
+                            return;
+                        };
+                        let row_styles_start = y * cols;
+                        let row_styles_end = row_styles_start + cols;
+                        let row_styles =
+                            &p.cell_styles[row_styles_start..row_styles_end];
+                        let row_sel = crate::grid_emit::row_selection_for(
+                            p.selection,
+                            y,
+                            cols,
+                            p.display_offset,
+                        );
+                        crate::grid_emit::row_hints_for(
+                            p.hint_matches.as_deref(),
+                            p.focused_match.as_ref(),
+                            p.hovered_hyperlink,
+                            y,
+                            cols,
+                            p.display_offset,
+                            &mut hint_scratch,
+                        );
+                        crate::grid_emit::build_row_bg(
+                            row,
+                            cols,
+                            row_styles,
+                            renderer_ref,
+                            &p.term_colors,
+                            row_sel,
+                            &hint_scratch,
+                            &mut bg_scratch,
+                        );
+                        let cursor_col_for_row = if p.cursor_visible
+                            && (y as u16) == p.cursor_row
+                            && p.cursor_shape != rio_backend::ansi::CursorShape::Hidden
+                        {
+                            Some(p.cursor_col)
+                        } else {
+                            None
+                        };
+                        crate::grid_emit::build_row_fg(
+                            row,
+                            cols,
+                            y as u16,
+                            row_styles,
+                            &p.extras,
+                            renderer_ref,
+                            &p.term_colors,
+                            rasterizer,
+                            grid,
+                            p.font_px,
+                            p.cell_w,
+                            p.cell_h,
+                            row_sel,
+                            &hint_scratch,
+                            &font_library,
+                            p.route_id,
+                            cursor_col_for_row,
+                            &mut fg_scratch,
+                        );
+                        grid.write_row(y as u32, &bg_scratch, &fg_scratch);
                     };
-                    let row_sel = crate::grid_emit::row_selection_for(
-                        p.selection,
-                        y,
-                        cols,
-                        p.display_offset,
-                    );
-                    crate::grid_emit::row_hints_for(
-                        hint_matches_slice,
-                        focused_match_ref,
-                        hovered_hyperlink,
-                        y,
-                        cols,
-                        p.display_offset,
-                        &mut hint_scratch,
-                    );
-                    crate::grid_emit::build_row_bg(
-                        row,
-                        cols,
-                        &p.style_set,
-                        renderer_ref,
-                        &p.term_colors,
-                        row_sel,
-                        &hint_scratch,
-                        &mut bg_scratch,
-                    );
-                    crate::grid_emit::build_row_fg(
-                        row,
-                        cols,
-                        y as u16,
-                        &p.style_set,
-                        renderer_ref,
-                        &p.term_colors,
-                        rasterizer,
-                        grid,
-                        p.font_px,
-                        p.cell_w,
-                        p.cell_h,
-                        row_sel,
-                        &hint_scratch,
-                        &font_library,
-                        &mut fg_scratch,
-                    );
-                    grid.write_row(y as u32, &bg_scratch, &fg_scratch);
-                };
 
                 match rows_to_rebuild {
                     RowsToRebuild::None => {
@@ -3874,13 +3909,21 @@ impl Screen<'_> {
                     }
                     RowsToRebuild::All => {
                         for y in 0..p.visible_rows.len() {
-                            rebuild_row(y, grid, rasterizer);
+                            rebuild_row(p, y, grid, rasterizer);
                         }
                         grid.mark_full_rebuild_done();
                     }
-                    RowsToRebuild::Only(lines) => {
-                        for ld in lines {
-                            rebuild_row(ld.line, grid, rasterizer);
+                    RowsToRebuild::Dirty => {
+                        // Walk the snapshot rows; rebuild + clear the
+                        // per-row dirty bit. Set by `snapshot_visible`
+                        // for rows it copied this frame; cleared here
+                        // so next frame starts clean.
+                        for y in 0..p.visible_rows.len() {
+                            if !p.visible_rows[y].dirty {
+                                continue;
+                            }
+                            rebuild_row(p, y, grid, rasterizer);
+                            p.visible_rows[y].dirty = false;
                         }
                     }
                 }
@@ -3933,12 +3976,10 @@ impl Screen<'_> {
                 // window scaled_margin + the panel's layout rect
                 // offset inside the root container. Snap to integer
                 // pixels so `cell_size * grid_pos + grid_padding`
-                // always lands on pixel boundaries — same approach
-                // as `@floatFromInt(blank.top)` at
-                // `ghostty/src/renderer/generic.zig:1976-1981`.
-                // Without this, a fractional margin (e.g. Taffy
-                // layout computing 10.5px offsets) shifts the whole
-                // grid half a pixel and the bg fragment's
+                // always lands on pixel boundaries. Without this, a
+                // fractional margin (e.g. Taffy layout computing
+                // 10.5px offsets) shifts the whole grid half a pixel
+                // and the bg fragment's
                 // `floor((pixel - padding) / cell_size)` disagrees
                 // with the text vertex's `cell_size * grid_pos`
                 // about where cell boundaries are → visible seams.
@@ -4011,6 +4052,28 @@ impl Screen<'_> {
                 // composite them on top of their re-pushed selves.
                 self.sugarloaf.discard_frame();
             }
+
+            // Return each panel's snapshot buffers to the matching
+            // context's `renderable_content` so the next frame's
+            // `Renderer::run` can reuse the existing allocations
+            // (rows, per-cell styles, extras table). Closed routes
+            // simply drop their PanelFrame; the context (and its
+            // renderable_content) is gone too.
+            for (_, item) in self
+                .context_manager
+                .current_grid_mut()
+                .contexts_mut()
+                .iter_mut()
+            {
+                let route_id = item.val.route_id;
+                if let Some(idx) = panels.iter().position(|p| p.route_id == route_id) {
+                    let p = panels.swap_remove(idx);
+                    item.val.renderable_content.visible_rows = p.visible_rows;
+                    item.val.renderable_content.cell_styles = p.cell_styles;
+                    item.val.renderable_content.extras = p.extras;
+                }
+            }
+            panels.clear();
         }
 
         // Mark as dirty if we need continuous rendering (e.g.,
@@ -4066,10 +4129,10 @@ impl Screen<'_> {
         let cursor_pos = terminal.grid.cursor.pos;
         drop(terminal);
 
-        // Calculate pixel position of cursor
-        let cell_width = layout.dimension.width;
-        let line_height = self.sugarloaf.style().line_height;
-        let cell_height = layout.dimension.height * line_height;
+        // Calculate pixel position of cursor — canonical integer
+        // stride (line_height already baked into cell_height).
+        let cell_width = layout.cell.cell_width as f32;
+        let cell_height = layout.cell.cell_height as f32;
 
         // Validate dimensions before calculation
         if cell_width <= 0.0 || cell_height <= 0.0 {
@@ -4238,63 +4301,54 @@ impl Screen<'_> {
                 .renderable_content
                 .hint_matches = Some(matches);
 
-            // Mark lines with hint labels as damaged
-            let mut damaged_lines = std::collections::BTreeSet::new();
+            // Hint state changed (search input, label visibility,
+            // match selection). The visualization changes per-cell —
+            // hint highlights, label glyphs — without touching cell
+            // content, so we mark each affected line dirty on the
+            // live grid. The next snapshot picks them up via the
+            // per-row dirty walk and sets `visible_rows[y].dirty` so
+            // GPU emit re-emits those rows. Coarse fallback when we
+            // can't compute affected lines: `Full`.
             {
-                let current = &self.context_manager.current();
-                let hint_labels = &current.renderable_content.hint_labels;
-                let terminal = current.terminal.lock();
+                let current = self.context_manager.current_mut();
+                let hint_labels = current.renderable_content.hint_labels.clone();
+                let hint_matches = current.renderable_content.hint_matches.clone();
+                let mut terminal = current.terminal.lock();
                 let display_offset = terminal.display_offset();
                 let screen_lines = terminal.screen_lines();
-                drop(terminal);
 
-                if !hint_labels.is_empty() {
-                    // Collect all lines that have hint labels
-                    for label in hint_labels {
-                        let line = label.position.row.0 - display_offset as i32;
-                        if line >= 0 && (line as usize) < screen_lines {
-                            damaged_lines.insert(
-                                rio_backend::crosswords::LineDamage::new(
-                                    line as usize,
-                                    true,
-                                ),
-                            );
-                        }
+                let mut any = false;
+                for label in &hint_labels {
+                    let line = label.position.row.0 - display_offset as i32;
+                    if line >= 0 && (line as usize) < screen_lines {
+                        terminal.grid[rio_backend::crosswords::pos::Line(line)].dirty =
+                            true;
+                        any = true;
                     }
                 }
-
-                // Also damage lines with hint matches
-                if let Some(hint_matches) = &current.renderable_content.hint_matches {
+                if let Some(hint_matches) = &hint_matches {
                     for hint_match in hint_matches {
                         let start_line = hint_match.start().row.0 - display_offset as i32;
                         let end_line = hint_match.end().row.0 - display_offset as i32;
-
                         for line in start_line..=end_line {
                             if line >= 0 && (line as usize) < screen_lines {
-                                damaged_lines.insert(
-                                    rio_backend::crosswords::LineDamage::new(
-                                        line as usize,
-                                        true,
-                                    ),
-                                );
+                                terminal.grid[rio_backend::crosswords::pos::Line(line)]
+                                    .dirty = true;
+                                any = true;
                             }
                         }
                     }
                 }
-            }
+                drop(terminal);
 
-            let current = self.context_manager.current_mut();
-            if !damaged_lines.is_empty() {
                 current
                     .renderable_content
                     .pending_update
-                    .set_terminal_damage(TerminalDamage::Partial(damaged_lines));
-            } else {
-                // Force full damage if no specific lines (for hint highlights)
-                current
-                    .renderable_content
-                    .pending_update
-                    .set_terminal_damage(TerminalDamage::Full);
+                    .set_terminal_damage(if any {
+                        TerminalDamage::Partial
+                    } else {
+                        TerminalDamage::Full
+                    });
             }
         } else if !self.search_active() {
             // Clear hint state only if search is not active,

@@ -429,8 +429,56 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     }
                 }
             }
+            RioEventType::Rio(RioEvent::GlyphProtocolInstalled {
+                route_id,
+                registry,
+            }) => {
+                if let Some(route) = self.router.routes.get(&window_id) {
+                    route
+                        .window
+                        .screen
+                        .sugarloaf
+                        .font_library()
+                        .install_glyph_registry(route_id, registry);
+                }
+            }
+            RioEventType::Rio(RioEvent::GlyphProtocolQuery { route_id, cp }) => {
+                if let Some(route) = self.router.routes.get_mut(&window_id) {
+                    use rio_backend::ansi::glyph_protocol::{
+                        format_query_response, QueryStatus,
+                    };
+                    let library = route.window.screen.sugarloaf.font_library();
+                    let in_glossary = library
+                        .glyph_registry_for(route_id)
+                        .is_some_and(|r| r.contains(cp));
+                    let in_system = library.covers_codepoint(cp);
+                    let status = match (in_glossary, in_system) {
+                        (true, true) => QueryStatus::Both,
+                        (true, false) => QueryStatus::Glossary,
+                        (false, true) => QueryStatus::System,
+                        (false, false) => QueryStatus::Free,
+                    };
+                    let resp = format_query_response(cp, status);
+                    if let Some(item) = route
+                        .window
+                        .screen
+                        .context_manager
+                        .current_grid_mut()
+                        .get_by_route_id(route_id)
+                    {
+                        item.context_mut().messenger.send_bytes(resp.into_bytes());
+                    }
+                }
+            }
             RioEventType::Rio(RioEvent::CloseTerminal(route_id)) => {
                 if let Some(route) = self.router.routes.get_mut(&window_id) {
+                    route
+                        .window
+                        .screen
+                        .sugarloaf
+                        .font_library()
+                        .remove_glyph_registry(route_id);
+
                     if route
                         .window
                         .screen
@@ -462,19 +510,11 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
             RioEventType::Rio(RioEvent::CursorBlinkingChangeOnRoute(route_id)) => {
                 if let Some(route) = self.router.routes.get_mut(&window_id) {
                     if route_id == route.window.screen.ctx().current_route() {
-                        // Get cursor position for damage
-                        let cursor_line = {
-                            let terminal = route
-                                .window
-                                .screen
-                                .ctx_mut()
-                                .current_mut()
-                                .terminal
-                                .lock();
-                            terminal.cursor().pos.row.0 as usize
-                        };
-
-                        // Set terminal damage for cursor line
+                        // Cursor blink toggles the cursor sprite (a
+                        // separate quad), not cell content — so we
+                        // signal `CursorOnly` and the GPU emit skips
+                        // per-row rebuild while the cursor uniform
+                        // updates downstream.
                         route
                             .window
                             .screen
@@ -483,14 +523,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                             .renderable_content
                             .pending_update
                             .set_terminal_damage(
-                                rio_backend::event::TerminalDamage::Partial(
-                                    [rio_backend::crosswords::LineDamage::new(
-                                        cursor_line,
-                                        true,
-                                    )]
-                                    .into_iter()
-                                    .collect(),
-                                ),
+                                rio_backend::event::TerminalDamage::CursorOnly,
                             );
 
                         route.request_redraw();
@@ -603,20 +636,28 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     drop(terminal);
                 }
             }
-            RioEventType::Rio(RioEvent::ClipboardLoad(clipboard_type, format)) => {
+            RioEventType::Rio(RioEvent::ClipboardLoad(
+                route_id,
+                clipboard_type,
+                format,
+            )) => {
                 let Router {
                     routes, clipboard, ..
                 } = &mut self.router;
                 if let Some(route) = routes.get_mut(&window_id) {
                     if route.window.is_focused {
                         let text = format(clipboard.get(clipboard_type).as_str());
-                        route
+                        // Route the paste back to the panel that asked for it
+                        // (OSC 52 reply), not whichever panel happens to be
+                        // focused now.
+                        if let Some(item) = route
                             .window
                             .screen
-                            .ctx_mut()
-                            .current_mut()
-                            .messenger
-                            .send_bytes(text.into_bytes());
+                            .context_manager
+                            .get_by_route_id(route_id)
+                        {
+                            item.val.messenger.send_bytes(text.into_bytes());
+                        }
                     }
                 }
             }
@@ -630,41 +671,55 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     }
                 }
             }
-            RioEventType::Rio(RioEvent::PtyWrite(text)) => {
+            RioEventType::Rio(RioEvent::PtyWrite(route_id, text)) => {
                 if let Some(route) = self.router.routes.get_mut(&window_id) {
-                    route
-                        .window
-                        .screen
-                        .ctx_mut()
-                        .current_mut()
-                        .messenger
-                        .send_bytes(text.into_bytes());
-                }
-            }
-            RioEventType::Rio(RioEvent::TextAreaSizeRequest(format)) => {
-                if let Some(route) = self.router.routes.get_mut(&window_id) {
-                    let dimension =
-                        route.window.screen.context_manager.current().dimension;
-                    let text =
-                        format(crate::renderer::utils::terminal_dimensions(&dimension));
-                    route
-                        .window
-                        .screen
-                        .ctx_mut()
-                        .current_mut()
-                        .messenger
-                        .send_bytes(text.into_bytes());
-                }
-            }
-            RioEventType::Rio(RioEvent::ColorRequest(index, format)) => {
-                if let Some(route) = self.router.routes.get_mut(&window_id) {
-                    let terminal = route
+                    // Route reply bytes (CSI / OSC responses) back to the
+                    // PTY of the panel that emitted them, not whichever
+                    // panel happens to be focused.
+                    if let Some(item) = route
                         .window
                         .screen
                         .context_manager
-                        .current()
-                        .terminal
-                        .lock();
+                        .get_by_route_id(route_id)
+                    {
+                        item.val.messenger.send_bytes(text.into_bytes());
+                    }
+                }
+            }
+            RioEventType::Rio(RioEvent::TextAreaSizeRequest(route_id, format)) => {
+                if let Some(route) = self.router.routes.get_mut(&window_id) {
+                    if let Some(item) = route
+                        .window
+                        .screen
+                        .context_manager
+                        .get_by_route_id(route_id)
+                    {
+                        let dimension = item.val.dimension;
+                        let text = format(crate::renderer::utils::terminal_dimensions(
+                            &dimension,
+                        ));
+                        item.val.messenger.send_bytes(text.into_bytes());
+                    }
+                }
+            }
+            RioEventType::Rio(RioEvent::ColorRequest(route_id, index, format)) => {
+                if let Some(route) = self.router.routes.get_mut(&window_id) {
+                    // Read the originating panel's terminal colors and
+                    // route the reply back to that same panel — color
+                    // theme overrides via OSC 4 / OSC 10-19 are
+                    // per-context, so reading from `current()` would
+                    // mis-report when the user has focused a different
+                    // split mid-flight.
+                    let renderer_color = route.window.screen.renderer.colors[index];
+                    let Some(item) = route
+                        .window
+                        .screen
+                        .context_manager
+                        .get_by_route_id(route_id)
+                    else {
+                        return;
+                    };
+                    let terminal = item.val.terminal.lock();
                     let color: ColorRgb = match terminal.colors()[index] {
                         Some(color) => ColorRgb::from_color_arr(color),
                         // Ignore cursor color requests unless it was changed.
@@ -673,20 +728,11 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                         {
                             return
                         }
-                        None => ColorRgb::from_color_arr(
-                            route.window.screen.renderer.colors[index],
-                        ),
+                        None => ColorRgb::from_color_arr(renderer_color),
                     };
-
                     drop(terminal);
 
-                    route
-                        .window
-                        .screen
-                        .ctx_mut()
-                        .current_mut()
-                        .messenger
-                        .send_bytes(format(color).into_bytes());
+                    item.val.messenger.send_bytes(format(color).into_bytes());
                 }
             }
             RioEventType::Rio(RioEvent::CreateWindow) => {
@@ -1194,13 +1240,11 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
 
                 let layout = route.window.screen.sugarloaf.window_size();
 
-                let x = x.clamp(0.0, (layout.width as i32 - 1).into()) as usize;
-                let y = y.clamp(0.0, (layout.height as i32 - 1).into()) as usize;
-
-                // Snapshot the old mouse position before updating coordinates
-                // so we can detect whether the cursor moved to a new cell.
-                let old_x = route.window.screen.mouse.x;
-                let old_y = route.window.screen.mouse.y;
+                // Keep f64 precision all the way to the cell-grid
+                // divide. The old `as usize` cast here dropped
+                // subpixel info from HiDPI events.
+                let x = x.clamp(0.0, (layout.width as i32 - 1) as f64);
+                let y = y.clamp(0.0, (layout.height as i32 - 1) as f64);
 
                 route.window.screen.mouse.x = x;
                 route.window.screen.mouse.y = y;
@@ -1288,13 +1332,17 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     }
                 }
 
-                // Check if mouse is over island and set cursor to default
+                // Only force the default cursor while the island is
+                // visible — when it's hidden (hide_if_single + single
+                // tab on macOS) the band at the top has no tabs to
+                // hover, and the I-beam from the terminal grid below
+                // should stay during top-edge drags.
                 use crate::renderer::island::ISLAND_HEIGHT;
                 let scale_factor = route.window.screen.sugarloaf.scale_factor();
-                let island_height_px = (ISLAND_HEIGHT * scale_factor) as usize;
-                if route.window.screen.renderer.navigation.is_enabled()
-                    && y <= island_height_px
-                {
+                let island_height_px = (ISLAND_HEIGHT * scale_factor) as f64;
+                let num_tabs = route.window.screen.ctx().len();
+                let nav = &route.window.screen.renderer.navigation;
+                if nav.island_visible(num_tabs) && y <= island_height_px {
                     route.window.winit_window.set_cursor(CursorIcon::Default);
                     return;
                 }
@@ -1405,16 +1453,19 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                 let display_offset = route.window.screen.display_offset();
                 let point = route.window.screen.mouse_position(display_offset);
 
-                // Detect cell change by comparing pixel positions against cell
-                // dimensions, avoiding a second mouse_position() call.
-                let square_changed = x != old_x || y != old_y;
+                // Compare *cell* coordinates, not pixel coordinates, so
+                // subpixel HiDPI jitter inside the same cell doesn't
+                // re-fire hint / OSC-8 / hyperlink work every event.
+                let prev_cell = route.window.screen.mouse.last_cell;
+                let cell_changed = prev_cell != Some(point);
+                route.window.screen.mouse.last_cell = Some(point);
 
                 let inside_text_area = route.window.screen.contains_point(x, y);
                 let square_side = route.window.screen.side_by_pos(x);
 
-                // If the mouse hasn't changed cells, do nothing.
+                // If the cursor hasn't changed cells, do nothing.
                 // Force update when transitioning off a border so the cursor resets.
-                if !square_changed
+                if !cell_changed
                     && !was_on_border
                     && route.window.screen.mouse.square_side == square_side
                     && route.window.screen.mouse.inside_text_area == inside_text_area
@@ -1467,8 +1518,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                 if is_selecting {
                     route.window.screen.update_selection(point, square_side);
                     route.window.screen.context_manager.request_render();
-                } else if square_changed
-                    && route.window.screen.has_mouse_motion_and_drag()
+                } else if cell_changed && route.window.screen.has_mouse_motion_and_drag()
                 {
                     if lmb_pressed {
                         route.window.screen.mouse_report(32, ElementState::Pressed);
@@ -1497,12 +1547,11 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
 
                 match delta {
                     MouseScrollDelta::LineDelta(columns, lines) => {
-                        let current_id = route.window.screen.ctx().current().rich_text_id;
-                        if let Some(layout) =
-                            route.window.screen.sugarloaf.get_text_layout(&current_id)
-                        {
-                            let new_scroll_px_x = columns * layout.font_size;
-                            let new_scroll_px_y = lines * layout.font_size;
+                        let font_size =
+                            route.window.screen.ctx().current().dimension.font_size;
+                        if font_size > 0.0 {
+                            let new_scroll_px_x = columns * font_size;
+                            let new_scroll_px_y = lines * font_size;
                             route
                                 .window
                                 .screen
@@ -1696,9 +1745,6 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
             }
 
             WindowEvent::RedrawRequested => {
-                // let start = std::time::Instant::now();
-                route.window.winit_window.pre_present_notify();
-
                 route.begin_render();
 
                 match route.path {

@@ -6,11 +6,10 @@ use crate::config::colors::ColorRgb;
 use crate::crosswords::grid::Scroll;
 use crate::crosswords::pos::{Direction, Pos};
 use crate::crosswords::search::{Match, RegexSearch};
-use crate::crosswords::LineDamage;
 use crate::error::RioError;
 use rio_window::event::Event as RioWindowEvent;
 use std::borrow::Cow;
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::fmt::Formatter;
 use std::sync::Arc;
@@ -46,16 +45,25 @@ pub enum ClickState {
     TripleClick,
 }
 
-/// Terminal damage information for efficient rendering
-#[derive(Debug, Clone, PartialEq, Default)]
+/// Terminal damage hint — coarse signal for the renderer's update path.
+/// The actual per-row decision lives on the snapshot's `Row::dirty`
+/// (post-`snapshot_visible`); this enum just gates `update` itself
+/// (skip vs incremental vs full rebuild). Variants:
+/// - `Noop` — no terminal-side change worth rendering for
+/// - `Full` — global state changed (resize, palette, mode flip),
+///   force a full rebuild even if no individual row is dirty
+/// - `Partial` — at least one row's content changed; the snapshot's
+///   per-row dirty bits identify which rows
+/// - `CursorOnly` — cursor moved/blinked, no cell content changed
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TerminalDamage {
     /// Nothing changed — skip rendering entirely
     #[default]
     Noop,
     /// The entire terminal needs to be redrawn
     Full,
-    /// Only specific lines need to be redrawn
-    Partial(BTreeSet<LineDamage>),
+    /// At least one row changed; consult per-row dirty bits
+    Partial,
     /// Only the cursor position has changed
     CursorOnly,
 }
@@ -76,6 +84,28 @@ pub enum RioEvent {
     UpdateGraphics {
         route_id: usize,
         queues: UpdateQueues,
+    },
+    /// A pane's Glyph Protocol registry just became live (first
+    /// `register` after session start, or first register following
+    /// a clear-all). Frontend installs it into the font library so
+    /// subsequent renders consult it. Fires at most once per
+    /// (route_id × registry-arc) pair; the registry is Arc-shared,
+    /// so further `register`/`clear` mutations made through the
+    /// existing handle are visible without re-firing.
+    GlyphProtocolInstalled {
+        route_id: usize,
+        registry: sugarloaf::font::glyph_registry::GlyphRegistry,
+    },
+    /// A `q` (query) request arrived from the PTY in `route_id`. The
+    /// frontend computes the four-state status — System and/or
+    /// Glossary coverage — by consulting both `FontLibrary` (system
+    /// fonts) and the per-route glyph registry, then writes the
+    /// formatted reply back to the same pane's PTY. Asynchronous
+    /// because the dispatcher (in rio-backend) doesn't have access
+    /// to the FontLibrary; the frontend does.
+    GlyphProtocolQuery {
+        route_id: usize,
+        cp: u32,
     },
     Paste,
     Copy(String),
@@ -115,27 +145,40 @@ pub enum RioEvent {
 
     /// Request to write the contents of the clipboard to the PTY.
     ///
-    /// The attached function is a formatter which will correctly transform the clipboard content
-    /// into the expected escape sequence format.
+    /// `route_id` identifies the panel that emitted the request so
+    /// the bytes land on the originating PTY rather than whichever
+    /// panel happens to be focused. The attached function is a
+    /// formatter which transforms the clipboard content into the
+    /// expected escape-sequence form.
     ClipboardLoad(
+        usize,
         ClipboardType,
         Arc<dyn Fn(&str) -> String + Sync + Send + 'static>,
     ),
 
     /// Request to write the RGB value of a color to the PTY.
     ///
-    /// The attached function is a formatter which will correctly transform the RGB color into the
-    /// expected escape sequence format.
+    /// `route_id` identifies the panel that emitted the request so
+    /// the reply lands on the originating PTY. The attached function
+    /// is a formatter which transforms the RGB color into the
+    /// expected escape-sequence form.
     ColorRequest(
+        usize,
         usize,
         Arc<dyn Fn(ColorRgb) -> String + Sync + Send + 'static>,
     ),
 
-    /// Write some text to the PTY.
-    PtyWrite(String),
+    /// Write some text to the PTY identified by `route_id`. Routing
+    /// by panel (rather than the focused context) is required so
+    /// CSI / OSC reply bytes land on the shell that asked for them
+    /// even if the user focuses a different split mid-flight.
+    PtyWrite(usize, String),
 
-    /// Request to write the text area size.
-    TextAreaSizeRequest(Arc<dyn Fn(WinsizeBuilder) -> String + Sync + Send + 'static>),
+    /// Request to write the text area size to the PTY of `route_id`.
+    TextAreaSizeRequest(
+        usize,
+        Arc<dyn Fn(WinsizeBuilder) -> String + Sync + Send + 'static>,
+    ),
 
     /// Cursor blinking state has changed.
     CursorBlinkingChange,
@@ -187,10 +230,18 @@ impl Debug for RioEvent {
             RioEvent::ClipboardStore(ty, text) => {
                 write!(f, "ClipboardStore({ty:?}, {text})")
             }
-            RioEvent::ClipboardLoad(ty, _) => write!(f, "ClipboardLoad({ty:?})"),
-            RioEvent::TextAreaSizeRequest(_) => write!(f, "TextAreaSizeRequest"),
-            RioEvent::ColorRequest(index, _) => write!(f, "ColorRequest({index})"),
-            RioEvent::PtyWrite(text) => write!(f, "PtyWrite({text})"),
+            RioEvent::ClipboardLoad(route_id, ty, _) => {
+                write!(f, "ClipboardLoad(route={route_id}, {ty:?})")
+            }
+            RioEvent::TextAreaSizeRequest(route_id, _) => {
+                write!(f, "TextAreaSizeRequest(route={route_id})")
+            }
+            RioEvent::ColorRequest(route_id, index, _) => {
+                write!(f, "ColorRequest(route={route_id}, idx={index})")
+            }
+            RioEvent::PtyWrite(route_id, text) => {
+                write!(f, "PtyWrite(route={route_id}, {text})")
+            }
             RioEvent::Title(title) => write!(f, "Title({title})"),
             RioEvent::TitleWithSubtitle(title, subtitle) => {
                 write!(f, "TitleWithSubtitle({title}, {subtitle})")
@@ -216,6 +267,12 @@ impl Debug for RioEvent {
             RioEvent::RenderRoute(route) => write!(f, "Render route {route}"),
             RioEvent::TerminalDamaged(route_id) => {
                 write!(f, "TerminalDamaged route {route_id}")
+            }
+            RioEvent::GlyphProtocolInstalled { route_id, .. } => {
+                write!(f, "GlyphProtocolInstalled route {route_id}")
+            }
+            RioEvent::GlyphProtocolQuery { route_id, cp } => {
+                write!(f, "GlyphProtocolQuery route {route_id} cp {cp:#x}")
             }
             RioEvent::Scroll(scroll) => write!(f, "Scroll {scroll:?}"),
             RioEvent::Bell => write!(f, "Bell"),

@@ -7,8 +7,6 @@ pub mod search;
 pub mod trail_cursor;
 pub mod utils;
 
-use crate::context::renderable::TerminalSnapshot;
-use rio_backend::crosswords::LineDamage;
 use rio_backend::event::TerminalDamage;
 use taffy::NodeId;
 
@@ -25,8 +23,24 @@ use rio_backend::config::navigation::Navigation;
 use rio_backend::config::Config;
 use rio_backend::event::EventProxy;
 use rio_backend::sugarloaf::Sugarloaf;
-use std::collections::BTreeSet;
-use std::ops::RangeInclusive;
+
+/// The window-bg clear alpha that flows into sugarloaf's
+/// `set_background_color`. Stored on the renderer and re-applied on
+/// every `effective_bg` write so OSC 11 changes don't reset
+/// transparency to 1.0.
+///
+/// - Glass blur styles force `0.0` so the macOS-26 `NSGlassEffectView`
+///   under the metal layer is what shows through.
+/// - Otherwise it's the configured `window.opacity`, clamped to
+///   `[0, 1]`.
+#[inline]
+fn window_bg_alpha(config: &Config) -> f32 {
+    if config.window.blur.is_glass() {
+        0.0
+    } else {
+        config.window.opacity.clamp(0.0, 1.0)
+    }
+}
 
 pub struct Renderer {
     is_vi_mode_enabled: bool,
@@ -60,6 +74,16 @@ pub struct Renderer {
     // Dynamic background keep track of the original bg color and
     // the same r,g,b with the mutated alpha channel.
     pub dynamic_background: ([f32; 4], rio_backend::sugarloaf::Color, bool),
+    /// `window.opacity-cells` — apply window opacity to cells with an
+    /// SGR-set background too. Off by default. `cell_bg_alpha` is the
+    /// precomputed `(window.opacity * 255) as u8` to avoid a multiply
+    /// per cell.
+    pub opacity_cells: bool,
+    pub cell_bg_alpha: u8,
+    /// Target alpha for the window-bg clear (`0..=1`). 0 in glass
+    /// mode, otherwise `window.opacity`. Re-applied to `effective_bg`
+    /// every frame so OSC 11 doesn't undo the user's transparency.
+    pub window_bg_alpha: f32,
     pub custom_mouse_cursor: bool,
     pub trail_cursor_enabled: bool,
     pub trail_cursor: trail_cursor::TrailCursor,
@@ -72,8 +96,17 @@ impl Renderer {
 
         let mut dynamic_background =
             (named_colors.background.0, named_colors.background.1, false);
-        if config.window.opacity < 1. {
-            dynamic_background.1.a = config.window.opacity as f64;
+        // Window-bg target alpha. Cached here at init and re-applied
+        // to every OSC-11-driven `effective_bg` refresh in
+        // `Renderer::run` so a runtime bg change doesn't reset
+        // transparency to 1.0. Glass styles force alpha = 0 so the
+        // NSGlassEffectView underneath the metal layer can provide
+        // the actual translucent bg — `window_bg_alpha` returns 0 in
+        // that case, so the glass and `opacity < 1` paths share one
+        // assignment.
+        let target_bg_alpha = window_bg_alpha(config);
+        if config.window.blur.is_glass() || config.window.opacity < 1. {
+            dynamic_background.1.a = target_bg_alpha as f64;
             dynamic_background.2 = true;
         } else if config.window.background_image.is_some() {
             dynamic_background.1 = rio_backend::sugarloaf::Color::TRANSPARENT;
@@ -115,6 +148,9 @@ impl Renderer {
             },
             named_colors,
             dynamic_background,
+            opacity_cells: config.window.opacity_cells,
+            cell_bg_alpha: (config.window.opacity.clamp(0.0, 1.0) * 255.0).round() as u8,
+            window_bg_alpha: target_bg_alpha,
             search: search::SearchOverlay::default(),
             assistant: assistant::AssistantOverlay::default(),
             scrollbar: scrollbar::Scrollbar::new(config.enable_scroll_bar),
@@ -228,7 +264,6 @@ impl Renderer {
         &mut self,
         sugarloaf: &mut Sugarloaf,
         context_manager: &mut ContextManager<EventProxy>,
-        focused_match: &Option<RangeInclusive<Pos>>,
     ) -> (Option<crate::context::renderable::WindowUpdate>, bool) {
         let mut any_panel_dirty = false;
         let grid = context_manager.current_grid_mut();
@@ -258,8 +293,7 @@ impl Renderer {
             }
         }
 
-        for (key, grid_context) in grid.contexts_mut().iter_mut() {
-            let is_active = &active_key == key;
+        for (_key, grid_context) in grid.contexts_mut().iter_mut() {
             let panel_rect = grid_context.layout_rect;
             let context = grid_context.context_mut();
 
@@ -296,10 +330,18 @@ impl Renderer {
                 .take_terminal_damage();
             context.renderable_content.pending_update.reset();
 
-            // Compute snapshot at render time — extract PTY-side damage from the
-            // terminal, merge with any UI-side damage, and clear the in-flight
-            // flag so the PTY thread can send a new notification.
-            let terminal_snapshot = {
+            // Compute snapshot at render time — extract PTY-side damage
+            // from the terminal, merge with any UI-side damage, and clear
+            // the in-flight flag so the PTY thread can send a new
+            // notification. One lock + one materialize per frame per
+            // context: `snapshot_visible` populates `visible_rows` /
+            // `cell_styles` with damage-aware filtering, the rest of the
+            // misc fields (term_colors, kitty graphics state, dimensions,
+            // cursor, blink) get committed by value below. After the
+            // lock drops the renderer reads everything it needs from
+            // `renderable_content` — no second lock, no shared state
+            // with the live terminal.
+            {
                 let mut terminal = context.terminal.lock();
 
                 // Clear in-flight flag so PTY thread can notify again
@@ -328,62 +370,58 @@ impl Renderer {
 
                 terminal.reset_damage();
 
-                // Hand the computed damage off to the grid
-                // emission path in `Screen::render`. `snapshot` is
-                // still used on the non-macOS rich-text path below;
-                // this just persists a copy on the context. Cheap
-                // (`TerminalDamage::Partial` is a `BTreeSet` of a
-                // few dozen `LineDamage` entries at most).
-                context.renderable_content.last_frame_damage = damage.clone();
-
-                let snapshot = TerminalSnapshot {
-                    colors: terminal.colors,
-                    display_offset: terminal.display_offset(),
-                    blinking_cursor: terminal.blinking_cursor,
-                    visible_rows: terminal.visible_rows(),
-                    style_set: terminal.grid.style_set.clone(),
-                    extras_table: terminal.grid.extras_table.clone(),
-                    cursor: terminal.cursor(),
-                    damage,
-                    columns: terminal.columns(),
-                    screen_lines: terminal.screen_lines(),
-                    history_size: terminal.history_size(),
-                    kitty_virtual_placements: terminal
+                let snapshot_cols = terminal.columns();
+                terminal.snapshot_visible(
+                    &damage,
+                    snapshot_cols,
+                    &mut context.renderable_content.visible_rows,
+                    &mut context.renderable_content.cell_styles,
+                    &mut context.renderable_content.extras,
+                );
+                context.renderable_content.term_colors = terminal.colors;
+                context.renderable_content.display_offset = terminal.display_offset();
+                context.renderable_content.columns = snapshot_cols;
+                context.renderable_content.screen_lines = terminal.screen_lines();
+                context.renderable_content.history_size = terminal.history_size();
+                context.renderable_content.blinking_cursor = terminal.blinking_cursor;
+                context.renderable_content.cursor.state = terminal.cursor();
+                context.renderable_content.kitty_virtual_placements =
+                    terminal.graphics.kitty_virtual_placements.clone();
+                context.renderable_content.kitty_images =
+                    terminal.graphics.kitty_images.clone();
+                context.renderable_content.kitty_placements = {
+                    let mut placements: Vec<_> = terminal
                         .graphics
-                        .kitty_virtual_placements
-                        .clone(),
-                    kitty_images: terminal.graphics.kitty_images.clone(),
-                    kitty_placements: {
-                        let mut placements: Vec<_> = terminal
-                            .graphics
-                            .kitty_placements
-                            .values()
-                            .filter(|p| {
-                                terminal.graphics.kitty_images.contains_key(&p.image_id)
-                            })
-                            .cloned()
-                            .collect();
-                        placements.sort_by_key(|p| p.z_index);
-                        placements
-                    },
-                    kitty_graphics_dirty: terminal.graphics.kitty_graphics_dirty,
+                        .kitty_placements
+                        .values()
+                        .filter(|p| {
+                            terminal.graphics.kitty_images.contains_key(&p.image_id)
+                        })
+                        .cloned()
+                        .collect();
+                    placements.sort_by_key(|p| p.z_index);
+                    placements
                 };
+                context.renderable_content.kitty_graphics_dirty =
+                    terminal.graphics.kitty_graphics_dirty;
                 terminal.graphics.kitty_graphics_dirty = false;
+                context.renderable_content.frame_damage = damage;
                 drop(terminal);
-
-                snapshot
-            };
+            }
 
             // Recalculate image overlay positions every frame when placements
             // exist. Positions depend on display_offset and history_size which
             // change on scroll and text output (like approach).
-            let has_overlays = !terminal_snapshot.kitty_placements.is_empty();
-            let has_virtual = !terminal_snapshot.kitty_virtual_placements.is_empty();
+            let rc = &context.renderable_content;
+            let has_overlays = !rc.kitty_placements.is_empty();
+            let has_virtual = !rc.kitty_virtual_placements.is_empty();
             if has_overlays || has_virtual {
-                let line_height = sugarloaf.style().line_height;
                 let layout = context.dimension;
-                let cell_width = layout.dimension.width;
-                let cell_height = layout.dimension.height * line_height;
+                // Canonical integer cell stride — line_height already
+                // baked into `cell.cell_height`. Same value the GPU
+                // grid uniform paints with.
+                let cell_width = layout.cell.cell_width as f32;
+                let cell_height = layout.cell.cell_height as f32;
                 let origin_x = panel_rect[0] + grid_scaled_margin.left;
                 let origin_y = panel_rect[1] + grid_scaled_margin.top;
 
@@ -394,11 +432,11 @@ impl Renderer {
                 overlays.clear();
 
                 if has_overlays {
-                    let history_size = terminal_snapshot.history_size as i64;
-                    let display_offset = terminal_snapshot.display_offset as i64;
-                    let screen_lines = terminal_snapshot.screen_lines as i64;
+                    let history_size = rc.history_size as i64;
+                    let display_offset = rc.display_offset as i64;
+                    let screen_lines = rc.screen_lines as i64;
 
-                    for p in &terminal_snapshot.kitty_placements {
+                    for p in &rc.kitty_placements {
                         let screen_row = p.dest_row - (history_size - display_offset);
                         let image_bottom_row = screen_row + p.rows as i64;
                         // Cull only if fully off-screen (like )
@@ -421,63 +459,22 @@ impl Renderer {
                 if has_virtual {
                     Self::push_virtual_placeholder_overlays(
                         overlays,
-                        &terminal_snapshot,
+                        rc,
                         origin_x,
                         origin_y,
                         cell_width,
                         cell_height,
                     );
                 }
-            } else if terminal_snapshot.kitty_graphics_dirty {
+            } else if rc.kitty_graphics_dirty {
                 // Placements were removed — clear overlays
                 sugarloaf.clear_image_overlays_for(context.rich_text_id);
             }
 
-            // Get hint matches from renderable content
-            let hint_matches = context.renderable_content.hint_matches.as_deref();
-
-            // Update cursor state from snapshot
-            context.renderable_content.cursor.state = terminal_snapshot.cursor.clone();
-
-            let mut specific_lines: Option<BTreeSet<LineDamage>> = None;
-
-            // Check for partial damage to optimize rendering
-            if !force_full_damage {
-                match &terminal_snapshot.damage {
-                    TerminalDamage::Noop => {
-                        // Should not reach here — Noop is handled before snapshot
-                        continue;
-                    }
-                    TerminalDamage::Full => {
-                        // Full damage, render everything
-                    }
-                    TerminalDamage::Partial(lines) => {
-                        if !lines.is_empty() {
-                            specific_lines = Some(lines.clone());
-                        }
-                    }
-                    TerminalDamage::CursorOnly => {
-                        specific_lines = Some(
-                            [LineDamage {
-                                line: *context.renderable_content.cursor.state.pos.row
-                                    as usize,
-                                damaged: true,
-                            }]
-                            .into_iter()
-                            .collect(),
-                        );
-                    }
-                }
-            }
-
-            let rich_text_id = context.rich_text_id;
-
-            let mut is_cursor_visible =
-                context.renderable_content.cursor.state.is_visible();
             context.renderable_content.has_blinking_enabled =
-                terminal_snapshot.blinking_cursor;
+                context.renderable_content.blinking_cursor;
 
-            if terminal_snapshot.blinking_cursor {
+            if context.renderable_content.blinking_cursor {
                 let has_selection = context.renderable_content.selection_range.is_some();
                 if !has_selection {
                     let mut should_blink = true;
@@ -519,24 +516,7 @@ impl Renderer {
                     context.renderable_content.is_blinking_cursor_visible = true;
                     context.renderable_content.last_blink_toggle = None;
                 }
-
-                is_cursor_visible = context.renderable_content.is_blinking_cursor_visible;
             }
-
-            if !is_active && context.renderable_content.cursor.state.is_visible() {
-                is_cursor_visible = true;
-            }
-
-            // Grid renderer is the authoritative terminal text path on
-            // every platform now. The grid emits from terminal state
-            // directly and resolves its own cursor cells; the
-            // previously-computed damage / cursor visibility /
-            // hint-match info isn't used here.
-            let _ = specific_lines;
-            let _ = is_cursor_visible;
-            let _ = hint_matches;
-            let _ = focused_match;
-            let _ = rich_text_id;
         }
 
         let window_size = sugarloaf.window_size();
@@ -571,8 +551,8 @@ impl Renderer {
                 // taffy allocates fractional sizes while the grid
                 // snaps to whole cells.
                 let dim = grid_context.val.dimension;
-                let cell_w = dim.dimension.width.round().max(1.0);
-                let cell_h = dim.dimension.height.round().max(1.0);
+                let cell_w = dim.cell.cell_width as f32;
+                let cell_h = dim.cell.cell_height as f32;
                 let cols = dim.columns.max(1) as f32;
                 let rows = dim.lines.max(1) as f32;
                 let panel_left =
@@ -628,48 +608,17 @@ impl Renderer {
             );
         }
 
-        // Render panel borders (on top of terminal content)
+        // Render panel borders (on top of terminal content). Borders
+        // are flat rects today — the previous `Object` enum
+        // (Rect / Quad / RichText) was only ever populated with the
+        // Rect variant, so the dispatch is direct now.
         let grid_scaled_margin = context_manager.get_current_grid_scaled_margin();
-        for border_object in context_manager.get_panel_borders() {
-            match border_object {
-                rio_backend::sugarloaf::Object::Quad(quad) => {
-                    // Convert from physical pixels to logical coordinates
-                    let x = (quad.x + grid_scaled_margin.left) / scale_factor;
-                    let y = (quad.y + grid_scaled_margin.top) / scale_factor;
-                    let width = quad.width / scale_factor;
-                    let height = quad.height / scale_factor;
-
-                    let corner_radii = [
-                        quad.corner_radii.top_left / scale_factor,
-                        quad.corner_radii.top_right / scale_factor,
-                        quad.corner_radii.bottom_right / scale_factor,
-                        quad.corner_radii.bottom_left / scale_factor,
-                    ];
-
-                    // Render quad with rounded corners
-                    sugarloaf.quad(
-                        None,
-                        x,
-                        y,
-                        width,
-                        height,
-                        quad.background_color,
-                        corner_radii,
-                        0.0,
-                        1, // Higher order renders on top
-                    );
-                }
-                rio_backend::sugarloaf::Object::Rect(rect) => {
-                    // Simple rectangle (no rounded corners or borders)
-                    let x = (rect.x + grid_scaled_margin.left) / scale_factor;
-                    let y = (rect.y + grid_scaled_margin.top) / scale_factor;
-                    let width = rect.width / scale_factor;
-                    let height = rect.height / scale_factor;
-
-                    sugarloaf.rect(None, x, y, width, height, rect.color, 0.0, 1);
-                }
-                _ => {}
-            }
+        for rect in context_manager.get_panel_borders() {
+            let x = (rect.x + grid_scaled_margin.left) / scale_factor;
+            let y = (rect.y + grid_scaled_margin.top) / scale_factor;
+            let width = rect.width / scale_factor;
+            let height = rect.height / scale_factor;
+            sugarloaf.rect(None, x, y, width, height, rect.color, 0.0, 1);
         }
 
         // Derive the window bg color from the currently-active panel's
@@ -680,7 +629,7 @@ impl Renderer {
         // want it to follow focus the way does (each surface's
         // `terminal.colors.background` drives its own window chrome).
         let current_context = context_manager.current_grid_mut().current_mut();
-        let effective_bg = match &current_context.renderable_content.background {
+        let mut effective_bg = match &current_context.renderable_content.background {
             Some(crate::context::renderable::BackgroundState::Set(color)) => *color,
             // Explicit OSC 111 reset OR panel that never ran OSC 11 →
             // fall back to the config / dynamic_background (honors
@@ -689,6 +638,12 @@ impl Renderer {
                 self.dynamic_background.1
             }
         };
+        // Re-apply the configured window-bg alpha. Without this, an
+        // OSC 11 sequence that sets a new bg color resets the alpha
+        // to 1.0 and the window goes opaque even when
+        // `window.opacity < 1`. Glass mode forces alpha 0 so the
+        // backdrop view shows through.
+        effective_bg.a = self.window_bg_alpha as f64;
 
         let window_update = if self.last_window_bg != Some(effective_bg) {
             sugarloaf.set_background_color(Some(effective_bg));
@@ -722,7 +677,7 @@ impl Renderer {
     }
 
     /// Find hint label at the specified position
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    #[allow(dead_code)]
     fn find_hint_label_at_position<'a>(
         &self,
         renderable_content: &'a RenderableContent,
@@ -735,14 +690,13 @@ impl Renderer {
     }
 
     /// Scan visible rows for kitty Unicode-placeholder cells (U+10EEEE) and
-    /// push one `GraphicOverlay` per row-run. Ports the four key behaviors
-    /// from ghostty's `graphics_unicode.zig`:
+    /// push one `GraphicOverlay` per row-run. Implements four key behaviors
+    /// of the Kitty graphics Unicode-placeholder protocol:
     ///
     /// 1. Per-row `kitty_virtual_placeholder` flag check skips rows
     ///    with no placeholders.
     /// 2. Continuation rules — a cell with missing diacritics inherits
-    ///    from the previous cell on the row (`canAppend`,
-    ///    `graphics_unicode.zig:506-513`).
+    ///    from the previous cell on the row (`canAppend`).
     /// 3. Run aggregation — consecutive cells with same image / row /
     ///    sequential column collapse into one Placement
     ///    (`PlacementIterator.next`, `graphics_unicode.zig:36-99`).
@@ -752,7 +706,7 @@ impl Renderer {
     ///    (`renderPlacement`, `graphics_unicode.zig:212-329`).
     fn push_virtual_placeholder_overlays(
         overlays: &mut Vec<rio_backend::sugarloaf::GraphicOverlay>,
-        snapshot: &TerminalSnapshot,
+        rc: &RenderableContent,
         origin_x: f32,
         origin_y: f32,
         cell_width: f32,
@@ -762,10 +716,12 @@ impl Renderer {
             IncompletePlacement, PlaceholderRun, PLACEHOLDER,
         };
 
-        // Below text — matches ghostty's default for virtual placements.
+        // Below text by default for virtual placements — apps that
+        // want them above the glyphs set z-index explicitly via the
+        // graphics protocol.
         const VIRTUAL_Z_INDEX: i32 = -1;
 
-        for (line_idx, row) in snapshot.visible_rows.iter().enumerate() {
+        for (line_idx, row) in rc.visible_rows.iter().enumerate() {
             // Per-row dirty flag: skip rows that never had a placeholder
             // written. O(visible_w · visible_h) → O(rows_with_placeholders).
             if !row.kitty_virtual_placeholder {
@@ -783,7 +739,7 @@ impl Renderer {
                     if let Some((p, start_col)) = run.take() {
                         flush_run(
                             overlays,
-                            snapshot,
+                            rc,
                             p.complete(),
                             line_idx,
                             start_col,
@@ -797,10 +753,11 @@ impl Renderer {
                     continue;
                 }
 
-                let style = snapshot.style_set.get(square.style_id());
+                let style_idx = line_idx * rc.columns + col_idx;
+                let style = rc.cell_styles.get(style_idx).copied().unwrap_or_default();
                 let combining: &[char] = square
                     .extras_id()
-                    .and_then(|eid| snapshot.extras_table.get(eid))
+                    .and_then(|eid| rc.extras.get(&eid))
                     .map(|e| e.zerowidth.as_slice())
                     .unwrap_or(&[]);
 
@@ -818,7 +775,7 @@ impl Renderer {
                         if let Some((p, start_col)) = run.take() {
                             flush_run(
                                 overlays,
-                                snapshot,
+                                rc,
                                 p.complete(),
                                 line_idx,
                                 start_col,
@@ -830,11 +787,9 @@ impl Renderer {
                             );
                         }
                         // Default missing row/col on the FIRST cell of a
-                        // run — matches ghostty's
-                        // `graphics_unicode.zig:84-86`. Without this,
-                        // a subsequent cell with `Some(col)` couldn't
-                        // sequentially extend a run started by a cell
-                        // with `None`.
+                        // run. Without this, a subsequent cell with
+                        // `Some(col)` couldn't sequentially extend a
+                        // run started by a cell with `None`.
                         if cell.row.is_none() {
                             cell.row = Some(0);
                         }
@@ -849,7 +804,7 @@ impl Renderer {
             if let Some((p, start_col)) = run {
                 flush_run(
                     overlays,
-                    snapshot,
+                    rc,
                     p.complete(),
                     line_idx,
                     start_col,
@@ -871,7 +826,7 @@ impl Renderer {
         #[allow(clippy::too_many_arguments)]
         fn flush_run(
             overlays: &mut Vec<rio_backend::sugarloaf::GraphicOverlay>,
-            snapshot: &TerminalSnapshot,
+            rc: &RenderableContent,
             run: PlaceholderRun,
             screen_line: usize,
             start_screen_col: usize,
@@ -881,15 +836,15 @@ impl Renderer {
             cell_height: f32,
             z_index: i32,
         ) {
-            let vp = snapshot
+            let vp = rc
                 .kitty_virtual_placements
                 .get(&(run.image_id, run.placement_id))
-                .or_else(|| snapshot.kitty_virtual_placements.get(&(run.image_id, 0)));
+                .or_else(|| rc.kitty_virtual_placements.get(&(run.image_id, 0)));
             let vp = match vp {
                 Some(v) => v,
                 None => return,
             };
-            let img = match snapshot.kitty_images.get(&run.image_id) {
+            let img = match rc.kitty_images.get(&run.image_id) {
                 Some(i) => i,
                 None => return,
             };
